@@ -5,8 +5,14 @@ format: pdf
 ---
 
 ```{r, echo = FALSE, message = FALSE, warning = FALSE}
-#install.packages("tidyquant")
-library("tidyquant")
+#install.packages("tidyquant") #for ticker price data
+library("tidyquant") 
+#install.packages("lubridate") #for date manipulation
+library("lubridate")
+#install.packages("tidyverse")
+library("tidyverse")
+#install.packages("dplyr")
+library("dplyr")
 ```
 
 ```{r}
@@ -30,4 +36,56 @@ head(optt)
 
 summary(optt)
 ```
+
+```{r}
+#tidy datatable
+
+#rename variables to be more 
+optt_tidy <- optt |> 
+  rename(open_price = open,
+         high_price = high,
+         low_price = low,
+         close_price = close,
+         Volume = volume,
+         Adjusted = adjusted) |> 
+
+#break date into day, month, year columns
+  separate(date, into = c("Year", "Month", "Day"), sep = "-", convert = TRUE) |> 
+  
+#add month name column
+  mutate(month_name = month.name[Month]) |> 
+  
+#place month name column after month number
+  relocate(month_name, .after = Month) |> 
+
+#create new variables
+  mutate(
+    #intra-day volatility
+    idv = (high_price-low_price),
+    #previous close price
+    prev_close = lag(close_price),
+    #absolute maximum upward movement
+    max_up = (abs(high_price - prev_close)),
+    #absolute maximum downward movement
+    max_down = (abs(low_price - prev_close))
+  )
+
+#idv, max_up, max_down will be used to calculate True Range, which will be used to calculate a 14-day Average True Range (ATR)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
