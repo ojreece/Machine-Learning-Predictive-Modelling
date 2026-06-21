@@ -1,6 +1,6 @@
 ---
 title: "OPTT Analysis"
-Author: "Oliver Reece"
+author: Oliver Reece
 format: pdf
 ---
 
@@ -13,6 +13,8 @@ library("lubridate")
 library("tidyverse")
 #install.packages("dplyr")
 library("dplyr")
+#install.packages("zoo") #for time-series analysis
+library("zoo")
 ```
 
 ```{r}
@@ -27,13 +29,11 @@ optt <- tq_get("OPTT",
 
 ```{r}
 #preview data
-
 head(optt)
 ```
 
 ```{r}
 #summary table
-
 summary(optt)
 ```
 
@@ -67,11 +67,27 @@ optt_tidy <- optt |>
     #absolute maximum upward movement
     max_up = (abs(high_price - prev_close)),
     #absolute maximum downward movement
-    max_down = (abs(low_price - prev_close))
+    max_down = (abs(low_price - prev_close)),
+    #true range:
+    #use pmax (parallel max) to take max for each day --> eliminates need for if/else + max()
+    true_range = pmax(idv, max_up, max_down, na.rm = TRUE),
+    #average true range:
+    #use rollmean (zoo package) to look at a sliding window
+    ATR = rollmean(true_range, k = 14, fill = NA, align = "right")
   )
-
-#idv, max_up, max_down will be used to calculate True Range, which will be used to calculate a 14-day Average True Range (ATR)
 ```
+
+```{r}
+#preview tidy data
+head(optt_tidy)
+```
+
+```{r}
+#view summary of tidy data
+summary(optt_tidy)
+```
+
+
 
 
 
