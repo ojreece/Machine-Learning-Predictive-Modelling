@@ -1,7 +1,7 @@
 # OPTT Machine Learning Project
 Applying machine learning techniques to analyse performance of stock ticker OPTT (Ocean Power Technologies Inc)
 
-In this project, I will be practicing building Linear Regression, Logistic Regression, Random Forest, XGBoost, and LSTM Network models to attempt to predict future stock performance of Ocean Power Technologies. 
+In this project, I will be practicing building Linear (OLS) Regression, Logistic Regression, Random Forest, XGBoost, and LSTM Network models to attempt to predict future stock performance of Ocean Power Technologies. 
 
 Ocean Power Technologies "provides intelligent maritime solutions and services that enable safer, cleaner, and more productive ocean operations for defense and security, oil and gas, science and research, and offshore wind markets" (https://oceanpowertechnologies.com/about-opt/our-company/). The company was founded in 1894. 
 
