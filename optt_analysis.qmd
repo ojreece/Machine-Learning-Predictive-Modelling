@@ -31,7 +31,9 @@ library("knitr")
 #install.packages("TTR") #pre-built financial analysis indicators
 library("TTR")
 #install.packages("kableExtra") #used for editing kable tables
-library(kableExtra)
+library("kableExtra")
+#install.packages("ggplot2") #clean visualisations
+library("ggplot2")
 
 ```
 
@@ -79,16 +81,17 @@ other metrics I can choose from, Volume is able to differentiate between directi
 and attention in the market. Volume focuses on how many shares are bought or sold, 
 meaning it is a good measure of general activity surrounding the stock itself as
 opposed to what the public think of the stock. I take the log of Volume due to
-it being right-skewed with a median of 7,710 vs a mean of 1,974,392.
+it being right-skewed with a median of 7,710 vs a mean of 1,974,392. 
 
 I will use a logistic regression model for risk analysis, using a "risk event" binary 
 as the dependent variable. The risk event will be triggered when a significant 
 price drop or sell-side volume spike occurs, or both. The models will be ordinal in nature, 
 each with 3 "severity" tiers, defined as:
 
-- Level 1 -> No Risk Event: Price Drop < 3% and Volume Multiple < 1.25
-- Level 2 -> Moderate Risk Event: Price Drop between 3%-7% (inclusive) or Volume Multiple between 1.25-2 (inclusive) AND neither metric surpasses Level 3 thresholds.
-- Level 3 -> High Risk Event: Price Drop > 7% or Volume Multiple > 2
+- **Level 1** -> No Risk Event: Price Drop < 3% and Volume Multiple < 1.25
+- **Level 2** -> Moderate Risk Event: Price Drop between 3% - 7% (inclusive) or Volume 
+Multiple between 1.25 - 2 (inclusive) AND neither metric surpasses Level 3 thresholds.
+- **Level 3** -> High Risk Event: Price Drop > 7% or Volume Multiple > 2
 
 I will then move into predictive modelling, using Random Forest, XGBoost, and LSTM Networks to 
 predict future performance. 
@@ -153,14 +156,18 @@ Of these 17 variables, some notable measures include:
 
 To illustrate the structured dataset, rows 34–39 are displayed below. Because 
 several indicators rely on rolling or exponential moving-average calculations of 
-varying lengths (e.g., a 14-day window for ATR and RSI, and a 26-day EMA for the 
-MACD line, followed by a further 9-day EMA for the MACD signal line), the initial 
-rows of the dataset default to NA values until each indicator has accumulated 
-sufficient historical data to produce a valid output. The MACD signal line, in 
-particular, does not return numeric values until row 34, as it requires the MACD 
-line itself to first be calculated. Rows 34–39 are therefore displayed to ensure 
-all indicators, including MACD and its derived histogram, are represented with 
-complete, numeric, and non-NA data points.
+varying lengths (e.g., a 14-day window for ATR and RSI, and a 26-day EMA - 
+Exponential Moving Average - for the MACD trendline, followed by a further 9-day 
+EMA for the MACD signal line), the initial rows of the dataset default to NA 
+values until each indicator has accumulated sufficient historical data to produce 
+a valid output. The MACD signal line, in particular, does not return numeric 
+values until row 34, as it requires the MACD line itself to first be calculated. 
+Rows 34–39 are therefore displayed to ensure all indicators, including MACD and 
+its derived histogram, are represented with complete, numeric, and non-NA values.
+
+In short, the following table represents values from June 12th, 2007 - June 19th,
+2007. June 16 and June 17 are omitted as they fall on a Saturday and Sunday which
+are non-trading days, meaning no data can be collected on those days.
 
 ```{r}
 #pull OPTT ticker data for all time since going public.
@@ -254,6 +261,67 @@ optt_tidy |>
   kable() |> 
   kable_styling(font_size = 12)
 ```
+
+
+MACD is the Moving Average Convergence Divergence, essentially a 
+tool used to determine buy/sell signals, price trends, and momentum. There are 3
+main parts to MACD: the trendline, the signal line, and the histogram. 
+
+The MACD trendline is the main part of this indicator. it is calculated by 
+subtracting a 26-period EMA from a 12-period EMA. The 26-period EMA is the 
+longer-term trend and the 12-period EMA is the shorter-term momentum. EMA stands
+for Exponential Moving Average and is a metric that smooths out the price data
+to gauge a better view of the direction and momentum of trends. It is used over
+standard moving averages because it puts higher emphasis on later data points, 
+which matter most in the stock market. Due to the volatility of the OPTT stock, 
+I elect to use 12 and 26 period EMAs as opposed to 50 and 200 period EMAs which 
+might be more favourable to longer term analysis or more stable stocks. 
+
+The MACD signal line is a 9-period moving average of the MACD trendline. In 
+other words, it acts as a "slower" baseline metric for the momentum of the stock 
+which can then be compared to the "faster" tredline.
+
+That relationship is expressed by the MACD histogram. It is a metric that helps 
+investors determine it is a bullish vs bearish market, which in turn aids in 
+determining whether or not to buy or sell the stock. I calculate this value by 
+subtracting the macd signal from the macd trendline value for any given 
+observation, represented as `macd_hist` in the table above.
+
+Below is the values of the MACD histogram displayed as a histogram:
+
+-placeholder for macd_hist histogram output- 
+```{r}
+#macd histogram
+hist <- ggplot(optt_tidy, aes(x=macd_hist)) +
+  geom_histogram(fill = "steelblue", colour = "navy", bins = 100) +
+  geom_vline(xintercept = 0, linetype = "dashed", size = 0.75, colour = "red") +
+  labs(title = "MACD Histogram Distribution",
+       subtitle = "Ticker: OPTT",
+       x = "MACD Histogram Value",
+       y = "Frequency") +
+  theme_classic()
+
+
+hist
+```
+
+Looking at the pictured histogram, we see that the data is (for the most part), 
+normally distributed around 0 with a slight right-skew. This tells me that on
+average, across all time, momentum is neutral, meaning no real sustained bullish
+nor bearish trends. The extended tail that causes the right-skew is most likely
+a result of the initial bullish trend when the company first became public on the
+NASDAQ. This would explain why we don't see a tail of equal length on the left:
+the decline was slower, across a longer period of time, meaning the fluctuations
+during the decline will mitigate the effect of that sustained decline. On a 
+similar stream, we would expect the MACD histogram of a higher valued, more stable
+stock to have a tighter distribution. For example, an S&P500 tracker like VOO 
+could be expected to have a tighter distribution with a slight right-shift (not skew)
+due to it's sustained upward trend without the extreme volatility witnessed in 
+OPTT.
+
+Below is the exact MACD histogram for VOO:
+
+-placeholder for VOO MACD histogram for comparison-
 
 # Sentiment Analysis
 
