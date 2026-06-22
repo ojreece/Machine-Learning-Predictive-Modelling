@@ -28,6 +28,11 @@ library("jsonlite")
 library("newsanchor")
 #install.packages("knitr")
 library("knitr")
+#install.packages("TTR") #pre-built financial analysis indicators
+library("TTR")
+#install.packages("kableExtra") #used for editing kable tables
+library(kableExtra)
+
 ```
 
 ```{r}
@@ -36,31 +41,121 @@ finnhub_key <- Sys.getenv("FINNHUB_API_KEY")
 news_api_key <- Sys.getenv("NEWS_API_KEY")
 ```
 
-## Abstract
+# Abstract
 
--placeholder-
+Founded in 1894, Ocean Power Technologies (OPTT) is a martime-focused company with an emphasis on
+finding solutions to the need for more efficient/productive infrastructure. Their
+services span defense and security, oil and gas procurement, and off-shore wind markets.
 
-- What is OPTT? Founded? 
-- Talk about high risk, share dilution, operating loss
-- What is their current market valuation? (penny, market cap)
-- Talk about deal with US Gov.
-- What do I aim to do originally? What changed? Why?
-- What models? 
-- So what? Looking into whether traditional ML can handle the noise of penny stocks
+OPTT went public on the NASDAQ on the 25th of April, 2007. Initially, the stock 
+exploded, with a closing price high of $3,652.00 on November 12th, 2007. Ever since, 
+the stock has been on the decline, falling under $5 per share in early 2019. Crossing
+that $5 threshold means the stock is now classified as a penny stock. Ocean Power
+Technologies hosts a market cap of $74.6 Million (at the time of writing), thus 
+designating the company as a micro-cap company. 
 
-## The Data
+Since approximately 2012, OPTT has suffered in many ways that have led to investor
+dis-trust. The three main areas of concern are the high risk designation due to 
+high volatility, share dilution, and multi-million dollar operating losses. For
+example, between 2012 and 2026, the number of shares (approximately) increased from
+5 million to 180 million while total operating losses during that time exceeded
+$300 Million.
 
--placeholder-
+That being said, OPTT is not entirely out of the market. On January 6th, 2026 
+OPTT announced they had been awarded a contract by the U.S. Department of Homeland 
+Security for the purpose of supplying the U.S. Coast Guard with their new 
+PowerBuoy systems. The contract was valued at $6.5 Million. This contract was not
+only a lifeline for OPTT but marked the transition from a sustainability focused 
+private company into what is now essentially a revenue focused defense contractor. 
 
-- Where does data come from?
-- Time frame? 
-- Num_observations?
-- Key variables?
-- Omitted Alt Data
+In this project, I use statistical modelling and financial metrics to 
+analyse OPTT's performance and risk overtime. From there I aim to make inferences 
+about whether thus far the contract has begun to aid OPTT recover. I then test 
+my inferences using machine learning algorithms to predict future stock prices. 
 
-To illustrate the structured dataset, rows 14–19 are displayed below. Because the 
-ATR calculation utilises a 14-day sliding window, the initial 13 observations by
-default result in NA values. Examining rows 14–19 ensures the inclusion of complete data points.
+I will be using OLS regression models for performance analysis, using volatility
+as the dependent variable.
+
+I will use a logistic regression model for risk analysis, using a "risk event" binary 
+as the dependent variable. The risk event will be triggered when a significant 
+price drop or sell-side volume spike occurs, or both. The models will be ordinal in nature, 
+each with 3 "severity" tiers, defined as:
+
+- Level 1 -> No Risk Event: Price Drop < 3% and Volume Multiple < 1.25
+- Level 2 -> Moderate Risk Event: Price Drop between 3%-7% (inclusive) or Volume Multiple between 1.25-2 (inclusive) AND neither metric surpasses Level 3 thresholds.
+- Level 3 -> High Risk Event: Price Drop > 7% or Volume Multiple > 2
+
+I will then move into predictive modelling, using Random Forest, XGBoost, and LSTM Networks to 
+predict future performance. 
+
+For the LSTM Network, the adjusted closing price will be the 
+outcome variable. I am using adjusted closing over opening or closing price due
+to the notion that an ML algorithm will look at fluctuations between day as catastrophic
+economic events if the drop is significant enough from one day to another. It is 
+also of note that if that drop is caused by a volatility spike, the adjusted closing
+price will catch it. Moreover, the adjusted closing price would back-trace historical 
+data which would prevent the model from falling for false inter-day price gaps.
+
+For the Random Forest and XGBoost algorithms, it does not make sense to predict 
+price as a raw dollar metric due to the lack of trend-awareness that these
+algorithms possess. Both algorithms function by breaking the data down into rectangular 
+cross sections based on real historic data. Thus, these models will never predict
+a future dollar price that exceeds the upper and lower bounds of the data - a 
+reality that does not exist in the stock market. As a solution, I will predict 
+returns using a calculated percent change metric as the outcome variable. This
+percent change will be calculated using adjusted closing price
+
+To conclude, I will compare the effectiveness of the 3 ML models using error scores
+to determine which stand-alone algorithm performed best.  
+
+Why does any of this matter? Firstly, I enjoy machine learning and investing, 
+so this was a natural project for me to take on. Secondly, it is an interesting
+question to ask - can traditional ML handle the noise of penny stocks? Currently, 
+analysts rely on hybrid algorithms that incorporate classification models, and 
+sentiment analysis. In most cases, LSTM's tend to confuse the noise of unexpected 
+price spikes that are overly common in penny stocks for true trends, and I want to
+see the comparison myself. 
+
+# The Data
+
+In order to take on this project, I utilise a variety of methods to procure data.
+The main pathway is the `tidyquant` package from which I am able to download 
+historic data about the desired ticker. `tidyquant` primarily leans on Yahoo
+Finance for key metrics, but also pulls from several other databases such as 
+the Federal Reserve Economic Data (FRED).
+
+I also make queries to NewsAPI and Finnhub, two APIs that allow me to scrape for
+media related to my chosen ticker in order to perform sentiment analysis in 
+conjunction with the machine learning models. Unfortunately, there is limited 
+results for Ocean Power Technologies and as such I do not continue down this path.
+
+Using `tidyquant`, I retrieve data from April 25th, 2007 (IPO) until June 21st, 
+2026 which is the date of writing, although the data becomes usable after row 34 
+due to the staggered system in which some calculated metrics such as MACD work. 
+That being said, the complete dataset boasts 4,819 observations across 17 
+variables (22 when including ticker name, year, month, month name, and day).
+
+Of these 17 variables, some notable measures include:
+
+- **`open_price`**: Stock price at open on a given trading day
+- **`close_price`**: Stock price at close on a given trading day
+- **`Volume`**: Number of shares traded (bought or sold) during a given trading day
+- **`true_range`**: Total price volatility by finding the greatest distance between current high, current low and previous closing price
+- **`ATR`**: Moving average of true range over a 14-day period
+- **`rsi`**: Relative Strength Index: Measures magnitude and speed of price fluctuations on a scale of 0-100 (momentum indicator)
+- **`macd_hist`**: Measures if the stock's momentum is speeding up or slowing down
+- **`obv`**: On-Balance Volume: Relationship metric between volume and price used to spot divergences
+
+To illustrate the structured dataset, rows 34–39 are displayed below. Because 
+several indicators rely on rolling or exponential moving-average calculations of 
+varying lengths (e.g., a 14-day window for ATR and RSI, and a 26-day EMA for the 
+MACD line, followed by a further 9-day EMA for the MACD signal line), the initial 
+rows of the dataset default to NA values until each indicator has accumulated 
+sufficient historical data to produce a valid output. The MACD signal line, in 
+particular, does not return numeric values until row 34, as it requires the MACD 
+line itself to first be calculated. Rows 34–39 are therefore displayed to ensure 
+all indicators, including MACD and its derived histogram, are represented with 
+complete, numeric, and non-NA data points.
 
 ```{r}
 #pull OPTT ticker data for all time since going public.
@@ -118,7 +213,19 @@ optt_tidy <- optt |>
     true_range = pmax(idv, max_up, max_down, na.rm = TRUE),
     #average true range:
     #use rollmean (zoo package) to look at a sliding window
-    ATR = rollmean(true_range, k = 14, fill = NA, align = "right")
+    ATR = rollmean(true_range, k = 14, fill = NA, align = "right"),
+    #RSI - Relative Strength Index - measures momentum (magnitude and speed of price fluctuations, 0-100)
+    rsi = RSI(close_price, n = 14),
+    #MACD - Moving Average Convergence Divergence
+    #helps identify whether stock has sustained movement or just noisy movement.
+    macd_trendline = MACD(close_price, nFast = 12, nSlow = 26, nSig = 9)[, "macd"],
+    macd_signal = MACD(close_price, nFast = 12, nSlow = 26, nSig = 9)[, "signal"],
+    #the distance between macd trend and signal is macd histogram
+    #acts as a measure of how strong the bullish or bearish momentum is 
+    macd_hist = (macd_trendline - macd_signal),
+    #On Balance Volume (OBV):
+    #essentially functions as a validity check of the price trend. 
+    obv = OBV(close_price, Volume)
   )
 ```
 
@@ -137,12 +244,13 @@ summary(optt_tidy)
 
 #professional table output using kable:
 optt_tidy |> 
-  select(Year,Month,Day,open_price,close_price,true_range,ATR) |> 
-  slice(14:19) |> 
-  kable()
+  select(open_price,close_price,Volume,true_range,ATR, rsi, macd_hist, obv) |> 
+  slice(34:39) |> 
+  kable() |> 
+  kable_styling(font_size = 12)
 ```
 
-## Sentiment Analysis
+# Sentiment Analysis
 
 ```{r}
 #finnhub Sentiment News Scoring
@@ -204,7 +312,7 @@ In order to maintain structural robustness via alternative data streams, the ana
 will pivot to integrate macroeconomic corporate health metrics, specifically metrics
 such as outstanding share dilution and order backlog growth.
 
-## Alternate Data Procurement
+# Alternate Data Procurement
 
 -placeholder-
 
@@ -217,7 +325,13 @@ solution --> forward stepwise function to fill for weekly / monthly data (outsta
 solution --> linear interpolation to fill for weekly / monthly data (order backlog growth)
 
 
+# Linear Regression Model
 
+-placeholder for written explanation of model-
+
+big question: does volatility relate to volume, in general, across the whole dataset
+
+LR_Model <- lm()
 
 
 
