@@ -73,8 +73,13 @@ analyse OPTT's performance and risk overtime. From there I aim to make inference
 about whether thus far the contract has begun to aid OPTT recover. I then test 
 my inferences using machine learning algorithms to predict future stock prices. 
 
-I will be using OLS regression models for performance analysis, using volatility
-as the dependent variable.
+I will be using OLS regression models for performance analysis, using the log of 
+Volume as the dependent variable. I am using volume because in contrast to the
+other metrics I can choose from, Volume is able to differentiate between direction
+and attention in the market. Volume focuses on how many shares are bought or sold, 
+meaning it is a good measure of general activity surrounding the stock itself as
+opposed to what the public think of the stock. I take the log of Volume due to
+it being right-skewed with a median of 7,710 vs a mean of 1,974,392.
 
 I will use a logistic regression model for risk analysis, using a "risk event" binary 
 as the dependent variable. The risk event will be triggered when a significant 
@@ -331,8 +336,16 @@ solution --> linear interpolation to fill for weekly / monthly data (order backl
 
 big question: does volatility relate to volume, in general, across the whole dataset
 
-LR_Model <- lm()
+```{}
+#regression model + output
+ols <- lm(log(Volume) ~ rsi + macd_hist + shares_outstanding + order_backlog_growth, data = optt_model)
+summary(ols)
+```
 
+```{}
+#check residuals
+plot(ols)
+```
 
 
 
