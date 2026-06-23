@@ -267,7 +267,7 @@ MACD is the Moving Average Convergence Divergence, essentially a
 tool used to determine buy/sell signals, price trends, and momentum. There are 3
 main parts to MACD: the trendline, the signal line, and the histogram. 
 
-The MACD trendline is the main part of this indicator. it is calculated by 
+The MACD trendline is the main part of this indicator. It is calculated by 
 subtracting a 26-period EMA from a 12-period EMA. The 26-period EMA is the 
 longer-term trend and the 12-period EMA is the shorter-term momentum. EMA stands
 for Exponential Moving Average and is a metric that smooths out the price data
@@ -279,18 +279,19 @@ might be more favourable to longer term analysis or more stable stocks.
 
 The MACD signal line is a 9-period moving average of the MACD trendline. In 
 other words, it acts as a "slower" baseline metric for the momentum of the stock 
-which can then be compared to the "faster" tredline.
+which can then be compared to the "faster" trendline.
 
 That relationship is expressed by the MACD histogram. It is a metric that helps 
 investors determine it is a bullish vs bearish market, which in turn aids in 
 determining whether or not to buy or sell the stock. I calculate this value by 
-subtracting the macd signal from the macd trendline value for any given 
+subtracting the MACD signal from the MACD trendline value for any given 
 observation, represented as `macd_hist` in the table above.
 
-Below is the values of the MACD histogram displayed as a histogram:
+Below are the values of the MACD histogram displayed as a histogram:
 
--placeholder for macd_hist histogram output- 
 ```{r}
+#| output: true
+
 #macd histogram
 hist <- ggplot(optt_tidy, aes(x=macd_hist)) +
   geom_histogram(fill = "steelblue", colour = "navy", bins = 100) +
@@ -358,8 +359,8 @@ finnhub_tidy <- finnhub_parsed |>
 #connect to NEWSAPI using newsanchor
 news_api_result <- get_everything(
   query = '"Ocean Power Technologies" OR "OPTT stock" OR "NASDAQ:OPTT"',
-  from = "2026-05-21",
-  to = "2026-06-21",
+  from = "2026-05-23",
+  to = "2026-06-23",
   api_key = news_api_key
 )
 
@@ -369,21 +370,51 @@ news_api_result$metadata$status_code
 news_api_result$results_df  
 
 #3 articles
+
+#clean news api data
+news_tidy <- news_api_result$results_df |> 
+  mutate(
+    #change column names to match finnhub to make joining easier
+    Date = as_date(published_at),
+    Text = title
+  ) |> 
+  rename(Source = name) |> 
+  select(Date, Text, Source, url)
 ```
 
--placeholder for data table with all 4 articles represented and brief discussion of them-
+
+```{r}
+#create and display combined scraped data
+scraped <- full_join(finnhub_tidy, news_tidy, by = c("Date", "Text", "Source", "url"))
+```
 
 After querying both NewsAPI and Finnhub, we returned a total of 4 relevant articles. 
 Due to concerns of limited data and subsequent biases, I will not be using sentiment analysis 
-scores within my models. 
+scores within my models. The table below shows the date and source of each relevant article.
 
-Instead, the analysis will focus on price-derived technical indicators alongside trading volume. 
-These variables are derived directly from empirical trading data, avoiding the sample-size and 
-bias concerns associated with the limited sentiment data.
+```{r}
+#| output: true
+scraped |> 
+  select(Date, Source) |> 
+  kable(caption = "Sentiment Data Article Origin") |> 
+  kable_styling(font_size = 10)
+```
+
+These four articles are not sufficient in terms of volume, however if used, another
+bias concern would arise: 50% of represented information would come from the same 
+source - GlobeNewswire. GlobeNewswire is not an independent journalism company, rather
+the company is paid by other companies (like Ocean Power Technologies) to publish
+and distribute press releases. In other words, the publications represented in 
+this scenario were written by Ocean Power Technologies themselves. 
+
+Instead of sentiment data, the following analysis will focus on price-derived 
+technical indicators alongside trading volume. These variables are derived directly 
+from empirical trading data, avoiding the sample-size and bias concerns associated 
+with the limited sentiment data.
 
 In order to maintain structural robustness via alternative data streams, the analysis 
-will pivot to integrate macroeconomic corporate health metrics, specifically metrics
-such as outstanding share dilution and order backlog growth.
+will pivot to integrate macroeconomic corporate health metrics, specifically 
+outstanding share dilution and order backlog growth.
 
 # Alternate Data Procurement
 
