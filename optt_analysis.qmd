@@ -262,6 +262,7 @@ optt_tidy |>
   kable_styling(font_size = 12)
 ```
 
+## MACD Explained
 
 MACD is the Moving Average Convergence Divergence, essentially a 
 tool used to determine buy/sell signals, price trends, and momentum. There are 3
@@ -359,8 +360,8 @@ finnhub_tidy <- finnhub_parsed |>
 #connect to NEWSAPI using newsanchor
 news_api_result <- get_everything(
   query = '"Ocean Power Technologies" OR "OPTT stock" OR "NASDAQ:OPTT"',
-  from = "2026-05-23",
-  to = "2026-06-23",
+  from = "2026-06-15",
+  to = "2026-07-15",
   api_key = news_api_key
 )
 
@@ -418,16 +419,57 @@ outstanding share dilution and order backlog growth.
 
 # Alternate Data Procurement
 
--placeholder-
+To supplement the market data, I require fundamental financial metrics to accurately 
+gauge the internal health of the company. Specifically, I focus on Outstanding Shares, 
+the Backlog-Sales Ratio, and Operating Loss. Outstanding Shares and Operating Loss are 
+sourced from the balance sheet and income statement, respectively, utilising the 
+Alpha Vantage API integrated within the tidyquant package. The Backlog-Sales Ratio, 
+calculated as Total Backlog Value divided by Total Revenue, requires historical 
+backlog data sourced directly from SEC filings.
 
-tq_get --> financials --> filter for type == income, unnest quarterly. 
+Upon reviewing these SEC filings, a notable anomaly emerged: order backlog was not 
+reported between 2015 and 2020. This gap coincides with OPTT's fundamental restructuring 
+phase, during which the company transitioned from grid-dependent buoys to the 
+self-sufficient models they manufacture today. Essentially, these were highly 
+concentrated research and development (R&D) years. Under SEC regulations up until 
+2020, if a company's order backlog became so insufficient that it lacked material 
+impact on their overall finances—effectively nearing \$0 - the company was permitted 
+to omit the data entirely. To accurately reflect this operational reality, I impute 
+the missing backlog data during these years with values of \$0.
 
-problem --> quarterly means 4 data points per year, not a lot of info (data-sparcity bias)
+Because the fundamental financial data is reported quarterly, it must be disaggregated 
+into monthly intervals to align with the broader dataset. Linear interpolation was 
+immediately ruled out; because it connects quarterly data points using trendlines, 
+it inherently relies on future data, which would introduce severe look-ahead bias 
+into the historical analysis.
 
-solution --> forward stepwise function to fill for weekly / monthly data (outstanding shares)
+A standard alternative is the Last Observation Carried Forward (LOCF) method, a 
+forward stepwise function that simply holds the quarterly value constant across 
+the subsequent months. By filling in the gaps with known data, we aim to limit 
+data-sparsity bias. However, the LOCF method introduces its own set of issues such 
+as information bias and volatility attenuation bias. By assuming the metric remains 
+constant between quarters, the LOCF function creates artificial steps in the data, 
+ultimately reducing its natural variance which is especially important to account 
+for given OPTT's status as a penny stock. Consequently, models trained on this 
+data might produce artificially stable results, leading to dangerous, false "low risk" predictions.
 
-solution --> linear interpolation to fill for weekly / monthly data (order backlog growth)
+To address this quarterly-to-monthly discrepancy, I evaluated three primary pathways:
 
+ - **No Imputation:** Leaving the data blank would result in statistically weak and highly fragmented analyses.
+ - **LOCF Imputation:** Utilising the stepwise function introduces the aforementioned volatility attenuation and false-stability biases.
+ - **Averaging Existing Metrics:** Leaving the gaps empty but averaging other higher-frequency metrics across quarters introduces significant Information Loss Bias and Temporal Masking.
+
+Ultimately, I opted against LOCF and standard interpolation in favour of advanced 
+temporal disaggregation techniques. Specifically, I rely on the Denton-Cholette 
+and Chow-Lin models. The Denton-Cholette method forces the newly generated monthly 
+data to track the volatility of a correlated, higher-frequency tertiary metric. 
+Similarly, the Chow-Lin method utilises a regression-based approach to achieve 
+this alignment. By leveraging these temporal disaggregation techniques, I can 
+successfully convert the quarterly data into monthly intervals while preserving 
+historical volatility and strictly avoiding look-ahead bias. 
+
+First I will use the Chow-Lin regression based method. This is more consistent 
+with standard econometric modelling practices, which makes more sense in this scenario.
 
 # Linear Regression Model
 
@@ -449,8 +491,64 @@ plot(ols)
 
 
 
+# References
 
+Chow-Lin Temporal Disaggregation:
+Chow, G. C., & Lin, A. L. (1971). Best Linear Unbiased Interpolation, Distribution, and Extrapolation of Time Series by Related Series. The Review of Economics and Statistics, 53(4), 372-375.
 
+Denton-Cholette Temporal Disaggregation:
+Denton, F. T. (1971). Adjustment of Monthly or Quarterly Series to Annual Totals: An Approach Based on Quadratic Minimization. Journal of the American Statistical Association, 66(333), 99-102.
+
+dplyr package:
+Wickham, H., François, R., Bryan, J., & Müller, K. (2023). dplyr: A Grammar of Data Manipulation. R package version 1.1.4. https://CRAN.R-project.org/package=dplyr
+
+ggplot2 package:
+Wickham, H. (2016). ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York. https://ggplot2.tidyverse.org
+
+httr package:
+Wickham, H. (2023). httr: Tools for Working with URLs and HTTP. R package version 1.4.7. https://CRAN.R-project.org/package=httr
+
+jsonlite package:
+Ooms, J. (2014). The jsonlite Package: A Practical and Consistent Mapping Between JSON Data and R Objects. arXiv:1403.2805 [stat.CO]. https://arxiv.org/abs/1403.2805
+
+kableExtra package:
+Zhu, H. (2024). kableExtra: Construct Complex Table with 'kable' and Pipe Syntax. R package version 1.4.0. https://CRAN.R-project.org/package=kableExtra
+
+knitr package:
+Xie, Y. (2023). knitr: A General-Purpose Package for Dynamic Report Generation in R. R package version 1.45. https://yihui.org/knitr/
+
+lubridate package:
+Grolemund, G., & Wickham, H. (2011). Dates and Times Made Easy with lubridate. Journal of Statistical Software, 40(3), 1-25. https://www.jstatsoft.org/v40/i03/
+
+newsanchor package:
+Ormerod, B., & Schoch, D. (2021). newsanchor: Client for the News API. R package version 0.1.1. https://CRAN.R-project.org/package=newsanchor
+
+tempdisagg package:
+Sax, C., & Steiner, P. (2013). Temporal Disaggregation of Time Series. The R Journal, 5(2), 80-87.
+
+tidyquant package:
+Dancho, M., & Vaughan, D. (2026). tidyquant: Tidy Quantitative Financial Analysis. R package version 1.0.12. https://github.com/business-science/tidyquant
+
+tidyverse package:
+Wickham, H., Averick, M., Bryan, J., Chang, W., McGowan, L. D., François, R., Grolemund, G., Hayes, A., Henry, L., Hester, J., Kuhn, M., Pedersen, T. L., Miller, E., Bache, S. M., Müller, K., Ooms, J., Robinson, D., Seidel, D. P., Spinu, V., Takahashi, K., Vaughan, D., Wilke, C., Woo, K., & Yutani, H. (2019). Welcome to the Tidyverse. Journal of Open Source Software, 4(43), 1686. https://doi.org/10.21105/joss.01686
+
+TTR package:
+Ulrich, J. (2026). TTR: Technical Trading Rules. R package version 0.24.4. https://github.com/joshuaulrich/ttr
+
+zoo package:
+Zeileis, A., & Grothendieck, G. (2005). zoo: S3 Infrastructure for Regular and Irregular Time Series. Journal of Statistical Software, 14(6), 1-27. https://doi.org/10.18637/jss.v014.i06
+
+Ocean Power Technologies SEC Filings:
+Ocean Power Technologies. (2026). SEC Filings. https://investors.oceanpowertechnologies.com/financial-information/sec-filings
+
+News API:
+News API. (2026). News API. https://newsapi.org
+
+Finnhub API:
+Finnhub. (2026). Finnhub Stock API. https://finnhub.io
+
+Alpha Vantage API:
+Alpha Vantage. (2026). Alpha Vantage API. https://www.alphavantage.co
 
 
 
