@@ -1,0 +1,7 @@
+"0","#pull OPTT ticker data for all time since going public."
+"0","#date format: YYYY-MM-DD"
+"0",""
+"0","optt <- tq_get(""OPTT"","
+"0","               get = ""stock.prices"","
+"0","               from = ""2007-04-25"", #went public on NASDAQ April 25th 2007"
+"0","               to = ""2026-06-21"") #at time of download, update as needed"

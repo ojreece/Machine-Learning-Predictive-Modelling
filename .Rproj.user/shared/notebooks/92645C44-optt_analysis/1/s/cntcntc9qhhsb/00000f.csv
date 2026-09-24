@@ -1,0 +1,8 @@
+"0","#| output: true"
+"0",""
+"0","#professional table output using kable:"
+"0","optt_tidy |>"
+"0","  select(open_price,close_price,Volume,true_range,ATR, rsi, macd_hist, obv) |>"
+"0","  slice(34:39) |>"
+"0","  kable() |>"
+"0","  kable_styling(font_size = 12)"
