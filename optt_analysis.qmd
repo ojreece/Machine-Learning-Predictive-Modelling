@@ -326,80 +326,76 @@ OPTT.
 ## Claude deleted .Renviron with API Keys so following won't load.
 ## will have to pull from github to get back.
 
-```{}
-#finnhub Sentiment News Scoring
+```{r}
+#Sentiment news data is cached in Sentiment_Cache.csv.
+#The APIs are only queried if the cache file does not exist.
+cache_file <- "Sentiment_Cache.csv"
 
-#connect to finnhub
-finnhub_url <- paste0(
-  "https://finnhub.io/api/v1/company-news?symbol=OPTT&from=2026-05-21&to=2026-06-21&token=", finnhub_key)
+if (file.exists(cache_file)) {
+  scraped <- read_csv(cache_file, show_col_types = FALSE)
+} else {
+  if (finnhub_key == "" || news_api_key == "") {
+    stop("FINNHUB_API_KEY / NEWS_API_KEY not set (restore .Renviron and restart R), ",
+         "and no Sentiment_Cache.csv exists.")
+  }
 
-#process data using httr and jsonlite
-finnhub_raw_data <- GET(finnhub_url)
-finnhub_parsed <- fromJSON(content(finnhub_raw_data, "text"))
+  #finnhub Sentiment News Scoring
+  finnhub_url <- paste0(
+    "https://finnhub.io/api/v1/company-news?symbol=OPTT&from=2026-10-12&to=2026-11-10&token=", finnhub_key)
 
-#preview parsed data
-head(finnhub_parsed)
-str(finnhub_parsed)
+  #process data using httr and jsonlite
+  finnhub_raw_data <- GET(finnhub_url)
+  stop_for_status(finnhub_raw_data)  #errors clearly on a bad key / rate limit
+  finnhub_parsed <- fromJSON(content(finnhub_raw_data, "text"))
+  if (!is.data.frame(finnhub_parsed)) {
+    #Finnhub returns [] when no articles match, which parses to an empty list
+    finnhub_parsed <- tibble(datetime = numeric(), headline = character(),
+                             source = character(), url = character())
+  }
 
-#clean parsed data into a usable format
-finnhub_tidy <- finnhub_parsed |>
-  mutate(
-    Date = as_date(as_datetime(datetime)),
-    Text = headline
-  ) |>
-  rename(Source = source) |>
-  select(Date, Text, Source, url)
+  #clean parsed data into a usable format
+  finnhub_tidy <- finnhub_parsed |>
+    mutate(
+      Date = as_date(as_datetime(datetime)),
+      Text = headline
+    ) |>
+    rename(Source = source) |>
+    select(Date, Text, Source, url)
 
-#only 1 article
-```
+  # News API Sentiment Scoring
+  news_api_result <- get_everything(
+    query = '"Ocean Power Technologies" OR "OPTT stock" OR "NASDAQ:OPTT"',
+    from = "2026-10-12",
+    to = "2026-11-10",
+    api_key = news_api_key
+  )
 
-```{}
-# News API Sentiment Scoring
+  #clean news api data
+  news_df <- news_api_result$results_df
+  if (is.null(news_df) || nrow(news_df) == 0) {
+    #no articles matched: use an empty table with the expected columns
+    news_df <- tibble(published_at = as.POSIXct(character()), title = character(),
+                      name = character(), url = character())
+  }
+  news_tidy <- news_df |>
+    mutate(
+      #change column names to match finnhub to make joining easier
+      Date = as_date(published_at),
+      Text = title
+    ) |>
+    rename(Source = name) |>
+    select(Date, Text, Source, url)
 
-#connect to NEWSAPI using newsanchor
-news_api_result <- get_everything(
-  query = '"Ocean Power Technologies" OR "OPTT stock" OR "NASDAQ:OPTT"',
-  from = "2026-08-12",
-  to = "2026-09-09",
-  api_key = news_api_key
-)
-
-#check to see if we got data
-news_api_result$metadata$total_results
-news_api_result$metadata$status_code
-news_api_result$results_df
-
-#3 articles
-
-#clean news api data
-news_tidy <- news_api_result$results_df |>
-  mutate(
-    #change column names to match finnhub to make joining easier
-    Date = as_date(published_at),
-    Text = title
-  ) |>
-  rename(Source = name) |>
-  select(Date, Text, Source, url)
-```
-
-
-```{}
-#create and display combined scraped data
-scraped <- full_join(finnhub_tidy, news_tidy, by = c("Date", "Text", "Source", "url"))
+  #combine scraped data and save to cache
+  scraped <- full_join(finnhub_tidy, news_tidy, by = c("Date", "Text", "Source", "url"))
+  write_csv(scraped, cache_file)
+}
 ```
 
 After querying both NewsAPI and Finnhub, across many trial runs between June and August 2026, on average 6 articles were returned,
 primarily originating from sources of high bias.
 Due to concerns of limited data and subsequent biases, I will not be using sentiment analysis
 scores within my models. The table below shows the date and source of each relevant article.
-
-```{}
-#| output: true
-scraped |>
-  select(Date, Source) |>
-  kable(caption = "Sentiment Data Article Origin") |>
-  kable_styling(font_size = 10)
-```
 
 These articles are not sufficient in terms of volume, however if used, another
 bias concern would arise: on average 43.75% of represented information would stem from the same
@@ -416,6 +412,10 @@ with the limited sentiment data.
 In order to maintain structural robustness via alternative data streams, the analysis
 will pivot to integrate macroeconomic corporate health metrics, specifically
 outstanding share dilution and top-line revenue recovery.
+
+After a pause on this project, I re-ran the code to find new articles with the goal of saving the 
+article data to a cached file to keep future results consistent. As it turns out, between
+October 12th and November 10th, there were zero relevant articles. Lesson learnt: save data sooner. 
 
 # Alternate Data Procurement
 
