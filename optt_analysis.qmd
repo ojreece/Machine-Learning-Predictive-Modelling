@@ -861,14 +861,41 @@ rf <- randomForest(next_return ~., data=Train, keep.forest = TRUE)
 
 ## XGBoost
 
-```{}
-install.packages("xgboost")
+```{r}
+#install.packages("xgboost")
 library(xgboost)
+#install.packages("modeldata")
+library(modeldata)
 
-labels <- as.integer(iris$Species) - 1
-features_matrix <- as.matrix(iris[, 1:4])
-dtrain <- xgb.DMatrix(data = features_matrix, label = labels)
+x_train <- as.matrix(Train[, setdiff(names(Train), "next_return")])
+x_test <- as.matrix(Test[, setdiff(names(Test), "next_return")])
+dtrain <- xgb.DMatrix(data = x_train, label = Train$next_return)
+dtest  <- xgb.DMatrix(data = x_test, label = Test$next_return)
+
+param <- list(eval_metric = "rmse",
+              objective = "reg:squarederror",
+              eta = 0.01,
+              max_depth = 3,
+              subsample = 0.7, 
+              colsample_bytree = 0.7,
+              min_child_weight = 10)
+watchlist <- list(train = dtrain, eval = dtest)
+
+xgb <- xgb.train(params = param,
+                 data = dtrain,
+                 nrounds = 500,
+                 watchlist = watchlist, 
+                 early_stopping_rounds = 50,
+                 print_every_n = 50)
+
+pred_test <- predict(xgb, dtest)
+rmse_test <- sqrt(mean((Test$next_return - pred_test)^2))
+rmse_baseline <- sqrt(mean((Test$next_return - mean(Train$next_return))^2))
+
+cat("Test RMSE:", rmse_test, "\nBaseline RMSE:", rmse_baseline, "\n")
 ```
+
+
 
 ## LightGBM (essentially the inverse of XGBoost - XGBoost is vertical, LightGBM is horizontal)
 ```{}
@@ -951,4 +978,8 @@ Finnhub. (2026). Finnhub Stock API. https://finnhub.io
 
 Alpha Vantage API:
 Alpha Vantage. (2026). Alpha Vantage API. https://www.alphavantage.co
+
+
+tutorials:
+https://www.youtube.com/watch?v=rNkBNPpb9CM
 
