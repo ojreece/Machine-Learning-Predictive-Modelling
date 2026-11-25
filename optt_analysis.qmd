@@ -36,6 +36,8 @@ library("kableExtra")
 library("ggplot2")
 install.packages("glmnet")
 library("glmnet")
+install.packages("randomForest")
+library(randomForest)
 
 ```
 
@@ -737,8 +739,26 @@ factor <- MODEL MODEL MODEL
 #predicting the next day's percent change in adjusted close: the predictors come from day t
 #and the outcome from day t+1, so no predictor contains the outcome
 optt_ml <- optt_model_tidy |>
-  mutate(next_return = (lead(Adjusted) / Adjusted - 1) * 100) |>
-  filter(!is.na(next_return)) #last day has no next day
+  mutate(
+    #outcome: next day's percent change in adjusted close
+    next_return = (lead(Adjusted) / Adjusted - 1) * 100,
+    #today's percent change, and the 5 days before it (all known at the close of day t)
+    return_t0 = (Adjusted / dplyr::lag(Adjusted, 1) - 1) * 100,
+    return_t1 = dplyr::lag(return_t0, 1),
+    return_t2 = dplyr::lag(return_t0, 2),
+    return_t3 = dplyr::lag(return_t0, 3),
+    return_t4 = dplyr::lag(return_t0, 4),
+    return_t5 = dplyr::lag(return_t0, 5),
+    #volume relative to its own 20 day average (raw volume drifts over 2007-2026)
+    #+1 avoids dividing by zero or taking the log of zero on zero volume days
+    vol_ratio = log((Volume + 1) / (rollmean(Volume, k = 20, fill = NA, align = "right") + 1))
+  ) |>
+  #keep only the outcome and the predictors being used. Dates and raw price levels are dropped:
+  #dates let trees memorise the time period, and raw prices are non-stationary
+  select(next_return, return_t0, return_t1, return_t2, return_t3, return_t4, return_t5,
+         rsi, macd_hist, ATR, true_range, vol_ratio) |>
+  #drop rows with NA from the lags/rolling windows and the last day (no next day)
+  na.omit()
 
 # split data for training and testing
 #70% train, 30% test
@@ -760,19 +780,23 @@ summary(Test)
 ## Ridge Regression (results don't mean much now, acts as a stabiliser in the weighted model)
 
 ```{r}
-# NOTE: NEED TO FIX TO BE TRAINED AND TESTED ON DIFFERENT SPLITS. NEED TO CACLUALTE RMSE FOR TEST AND TRAIN --> COMPARE. VIEW NON-ZERO COEFFICIENTS AT lambda.min
+# ridge regression on the same Train/Test split as the other models
+#predicting next_return, the same outcome as the random forest
 
+x_train <- makeX(Train[, setdiff(names(Train), "next_return")], na.impute = TRUE)
+x_test <- makeX(Test[, setdiff(names(Test), "next_return")], na.impute = TRUE)
+y_train <- Train$next_return
+y_test <- Test$next_return
 
-x <- makeX(optt_ml[, c("rsi", "macd_hist", "shares_outstanding", "Volume", "Adjusted")], na.impute = TRUE)
-y <- log(optt_ml$ATR)
-
-ridge <- glmnet(x, y, alpha = 0)
+ridge <- glmnet(x_train, y_train, alpha = 0)
 
 plot(ridge, xvar = "lambda", label = TRUE)
 
-#Perform 10-fold cross-validation
+#Perform 10-fold cross-validation on Train only
+#folds are contiguous blocks of days (not random) since this is a time series
 set.seed(11142026) # For reproducibility
-cv_ridge <- cv.glmnet(x, y, alpha = 0, nfolds = 10)
+foldid <- rep(1:10, each = ceiling(nrow(x_train) / 10))[1:nrow(x_train)]
+cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0, foldid = foldid)
 
 # Plot cross-validation results
 plot(cv_ridge)
@@ -788,18 +812,50 @@ lambda_1se <- cv_ridge$lambda.1se
 final_coefficients <- coef(cv_ridge, s = "lambda.min")
 print(final_coefficients)
 
-# Make predictions on new data (using the training matrix 'x' here as an example)
-predictions <- predict(cv_ridge, s = "lambda.min", newx = x)
-head(predictions)
+# Predict on Train and Test, then compare RMSE
+pred_train <- predict(cv_ridge, s = "lambda.min", newx = x_train)
+pred_test <- predict(cv_ridge, s = "lambda.min", newx = x_test)
+
+rmse_train <- sqrt(mean((y_train - pred_train)^2))
+rmse_test <- sqrt(mean((y_test - pred_test)^2))
+
+#baseline: always predict the training mean
+rmse_baseline <- sqrt(mean((y_test - mean(y_train))^2))
+
+cat("Train RMSE:", rmse_train, "\nTest RMSE:", rmse_test, "\nBaseline RMSE:", rmse_baseline, "\n")
 ```
 
 ## Random Forest
 
 ```{r}
-install.packages("randomForest")
-library(randomForest)
 
-#use Train dataset
+rf <- randomForest(next_return ~ .,data = Train, ntree = 500, importance = TRUE, proximity = TRUE)
+print(rf)
+important <- importance(rf)
+print(important)
+varImpPlot(rf)
+rf_maxnodes <- randomForest(next_return ~ . , data = Train, maxnodes = 10)
+rf_maxnodes
+
+predictions <- predict(rf, Train)
+predictions
+
+library(MASS)
+mds <- cmdscale(1-rf$proximity)
+plot(mds, col=as.numeric(cut(Train$next_return, breaks = 3)), pch=19, main="MDS of Proximity")
+#text(mds, labels = row.names(Train), cex = 0.7)
+
+rf_tune <- randomForest(next_return ~ ., data = Train, ntree=100, mtry = 2)
+print(rf_tune)
+
+best_mtry <- tuneRF(x=Train[, -which(names(Train) == "next_return")], y=Train$next_return, ntreeTry=500)
+print(best_mtry)
+
+rf <- randomForest(next_return ~., data=Train, keep.forest = TRUE)
+
+#can assign weights once I am happy with the model + variables. 
+#weights <- assign here
+#weighted_rf <- randomForest(next_return ~., data = Train, weights = weights)
 
 ```
 
