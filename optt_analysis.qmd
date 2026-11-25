@@ -34,6 +34,8 @@ library("TTR")
 library("kableExtra")
 #install.packages("ggplot2") #clean visualisations
 library("ggplot2")
+install.packages("glmnet")
+library("glmnet")
 
 ```
 
@@ -84,15 +86,18 @@ meaning it is a good measure of general activity surrounding the stock itself as
 opposed to what the public think of the stock. I take the log of Volume due to
 it being right-skewed with a median of 7,710 vs a mean of 1,974,392.
 
-I will use a logistic regression model for risk analysis, using a "risk event" binary
-as the dependent variable. The risk event will be triggered when a significant
-price drop or sell-side volume spike occurs, or both. The models will be ordinal in nature,
-each with 3 "severity" tiers, defined as:
+I will use an ordinal logistic regression model for risk analysis, using a "risk event"
+severity level as the dependent variable. The risk event will be triggered when a significant
+price drop or sell-side volume spike occurs, or both. The model is ordinal in nature,
+with 3 "severity" tiers, defined as:
 
 - **Level 1** -> No Risk Event: Price Drop < 3% and Volume Multiple < 1.25
 - **Level 2** -> Moderate Risk Event: Price Drop between 3% - 7% (inclusive) or Volume
 Multiple between 1.25 - 2 (inclusive) AND neither metric surpasses Level 3 thresholds.
 - **Level 3** -> High Risk Event: Price Drop > 7% or Volume Multiple > 2
+
+All predictors in the risk model are lagged by one day, so that the model only uses
+information available before the day of the event.
 
 I will then move into predictive modelling, using Random Forest, XGBoost, and LSTM Networks to
 predict future performance.
@@ -149,8 +154,8 @@ Of these 17 variables, some notable measures include:
 - **`open_price`**: Stock price at open on a given trading day
 - **`close_price`**: Stock price at close on a given trading day
 - **`Volume`**: Number of shares traded (bought or sold) during a given trading day
-- **`true_range`**: Total price volatility by finding the greatest distance between current high, current low and previous closing price
-- **`ATR`**: Moving average of true range over a 14-day period
+- **`true_range`**: Total price volatility by finding the greatest distance between current high, current low and previous closing price, as a percent of the closing price
+- **`ATR`**: Moving average of true range over a 14-day period (also a percent of the closing price)
 - **`rsi`**: Relative Strength Index: Measures magnitude and speed of price fluctuations on a scale of 0-100 (momentum indicator)
 - **`macd_hist`**: Measures if the stock's momentum is speeding up or slowing down
 - **`obv`**: On-Balance Volume: Relationship metric between volume and price used to spot divergences
@@ -191,6 +196,10 @@ summary(optt)
 ```
 
 ```{r}
+summary(optt$adjusted / optt$close)
+```
+
+```{r}
 #tidy datatable
 
 #rename variables to be more
@@ -221,10 +230,11 @@ optt_tidy <- optt |>
     max_up = (abs(high_price - prev_close)),
     #absolute maximum downward movement
     max_down = (abs(low_price - prev_close)),
-    #true range:
+    #true range, as a percent of that day's closing price:
     #use pmax (parallel max) to take max for each day --> eliminates need for if/else + max()
-    true_range = pmax(idv, max_up, max_down, na.rm = TRUE),
-    #average true range:
+    #divide by close_price so volatility is comparable across the full price history ($3,652 to under $1)
+    true_range = 100 * pmax(idv, max_up, max_down, na.rm = TRUE) / close_price,
+    #average true range (percent):
     #use rollmean (zoo package) to look at a sliding window
     ATR = rollmean(true_range, k = 14, fill = NA, align = "right"),
     #RSI - Relative Strength Index - measures momentum (magnitude and speed of price fluctuations, 0-100)
@@ -269,8 +279,9 @@ MACD is the Moving Average Convergence Divergence, essentially a
 tool used to determine buy/sell signals, price trends, and momentum. There are 3
 main parts to MACD: the trendline, the signal line, and the histogram.
 
-The MACD trendline is the main part of this indicator. It is calculated by
-subtracting a 26-period EMA from a 12-period EMA. The 26-period EMA is the
+The MACD trendline is the main part of this indicator. It is calculated as the
+percentage difference between a 12-period EMA and a 26-period EMA (the default in
+`TTR::MACD`), meaning all three MACD values are already scaled by price. The 26-period EMA is the
 longer-term trend and the 12-period EMA is the shorter-term momentum. EMA stands
 for Exponential Moving Average and is a metric that smooths out the price data
 to gauge a better view of the direction and momentum of trends. It is used over
@@ -287,7 +298,7 @@ That relationship is expressed by the MACD histogram. It is a metric that helps
 investors determine it is a bullish vs bearish market, which in turn aids in
 determining whether or not to buy or sell the stock. I calculate this value by
 subtracting the MACD signal from the MACD trendline value for any given
-observation, represented as `macd_hist` in the table above.
+observation, represented as `macd_hist` in the table above (in percentage points).
 
 Below are the values of the MACD histogram displayed as a histogram:
 
@@ -300,7 +311,7 @@ hist <- ggplot(optt_tidy, aes(x=macd_hist)) +
   geom_vline(xintercept = 0, linetype = "dashed", size = 0.75, colour = "red") +
   labs(title = "MACD Histogram Distribution",
        subtitle = "Ticker: OPTT",
-       x = "MACD Histogram Value",
+       x = "MACD Histogram Value (percentage points)",
        y = "Frequency") +
   theme_classic()
 
@@ -392,6 +403,11 @@ if (file.exists(cache_file)) {
 }
 ```
 
+```{r, sanity check}
+df_1211 <- read.csv(cache_file)
+head(df_1211)
+```
+
 After querying both NewsAPI and Finnhub, across many trial runs between June and August 2026, on average 6 articles were returned,
 primarily originating from sources of high bias.
 Due to concerns of limited data and subsequent biases, I will not be using sentiment analysis
@@ -412,10 +428,6 @@ with the limited sentiment data.
 In order to maintain structural robustness via alternative data streams, the analysis
 will pivot to integrate macroeconomic corporate health metrics, specifically
 outstanding share dilution and top-line revenue recovery.
-
-After a pause on this project, I re-ran the code to find new articles with the goal of saving the 
-article data to a cached file to keep future results consistent. As it turns out, between
-October 12th and November 10th, there were zero relevant articles. Lesson learnt: save data sooner. 
 
 # Alternate Data Procurement
 
@@ -578,18 +590,40 @@ alt_data_quarterly <- optt_quarterly_indicator |>
   select(fiscal_year, fiscal_quarter, revenue_q, net_loss_q, shares_outstanding_q)
 ```
 
-With the fundamentals disaggregated to fiscal quarters, I join them back onto every
-trading day that falls in the corresponding quarter, then drop the leading rows that
-are unusable regardless (rows 1-33, where MACD/MACD-signal have not yet accumulated
-enough history), to produce the final dataframe used for modelling.
+I still favour temporal disaggregation in principle, so the quarterly series above stays
+in the project, but I elect not to use it in the modelling dataframe. This is because it
+caused two problems. The first is that Volume is the outcome variable in my OLS model,
+meaning Revenue and Net Loss built using Volume would partly contain the very outcome I
+am trying to explain. The second is that spreading a fiscal year's figures across that
+whole year gives the model information that did not exist yet: these numbers are not
+public until OPTT files its 10-K, which happens a couple of months after the April 30th
+year-end.
+
+As a solution, each trading day instead takes the most recent annual figures that had
+actually been filed by that date. For simplicity, I assume each fiscal year's 10-K becomes
+available on July 15th of that calendar year (roughly 75 days after year-end). This is a
+step function, which mirrors how the market actually receives this information - a filed
+number that is valid until the next filing. That being said, trading days before July 15th,
+2012 have no fundamentals, and the FY2026 figures only become available on July 15th, 2026,
+after the last day of data (June 21st, 2026), meaning the most recent trading days carry
+the FY2025 figures.
 
 ```{r}
-#join main (daily) data with the disaggregated alt data, then tidy for model use
-optt_model <- optt_fiscal_calendar |>
-  select(fiscal_year, fiscal_quarter) |>
-  bind_cols(optt_tidy) |>
-  left_join(alt_data_quarterly, by = c("fiscal_year", "fiscal_quarter")) |>
-  rename(revenue = revenue_q, net_loss = net_loss_q, shares_outstanding = shares_outstanding_q)
+#date each fiscal year's figures become public (10-K filed roughly 75 days after April 30th)
+alt_data_annual <- alt_data_annual |>
+  mutate(available_from = as.Date(paste0(fiscal_year, "-07-15")))
+```
+
+With the availability dates attached, I join the figures onto every trading day, then drop
+the leading rows that are unusable regardless (rows 1-33, where MACD/MACD-signal have
+not yet accumulated enough history), to produce the final dataframe used for modelling.
+
+```{r}
+#join main (daily) data with the annual alt data as of each trading day (most recent
+#figures already filed), then tidy for model use
+optt_model <- optt_tidy |>
+  mutate(Date = make_date(Year, Month, Day)) |>
+  left_join(alt_data_annual, by = join_by(closest(Date >= available_from)))
 
 optt_model_tidy <- optt_model |>
   #row 33 is the last row with NA MACD/MACD-signal values (see "The Data" above)
@@ -606,8 +640,11 @@ summary(optt_model_tidy)
 # Ordinary Linear Squares Regression Model
 
 ```{r}
-ols_volume <- lm(log(Volume) ~ rsi + macd_hist + macd_signal + shares_outstanding + net_loss + obv + Adjusted,
-          data = optt_model_tidy)
+#obv is left out (it is built from Volume, the outcome) and so is macd_signal (macd_hist is already
+#macd - signal). Price, shares and net loss are trending levels, so price and shares are logged and
+#net loss is put in millions. Zero-volume days are dropped as log(0) is undefined.
+ols_volume <- lm(log(Volume) ~ rsi + macd_hist + log(shares_outstanding) + I(net_loss / 1e6) + log(Adjusted),
+          data = filter(optt_model_tidy, Volume > 0))
 summary(ols_volume)
 ```
 
@@ -618,8 +655,9 @@ plot(ols_volume)
 
 ```{r}
 
-ols_price <- lm(log(ATR) ~ rsi + macd_hist + macd_signal + shares_outstanding + net_loss + obv + Volume + Adjusted,
-          data = optt_model_tidy)
+#same changes as above; obv is cumulative (a trending level) so it is left out here too, and Volume is logged
+ols_price <- lm(log(ATR) ~ rsi + macd_hist + log(shares_outstanding) + I(net_loss / 1e6) + log(Volume) + log(Adjusted),
+          data = filter(optt_model_tidy, Volume > 0, ATR > 0))
 summary(ols_price)
 
 ## shares_outstanding and net_loss are currently NA
@@ -635,11 +673,10 @@ plot(ols_price)
 # Ordinal Logistic Regression Model
 
 ```{r}
-# use MASS:polr not glm & family binomial
+#ordinal logistic regression using MASS::polr (called with MASS:: so it does not mask dplyr::select)
 
 #define the levels and metrics:
 #The risk event will be triggered when a significant price drop or sell-side volume spike occurs, or both. 
-
 
 #- **Level 1** -> No Risk Event: Price Drop < 3% and Volume Multiple < 1.25
 # **Level 2** -> Moderate Risk Event: Price Drop between 3% - 7% (inclusive) or Volume
@@ -647,12 +684,44 @@ plot(ols_price)
 #- **Level 3** -> High Risk Event: Price Drop > 7% or Volume Multiple > 2
 
 #volume multiple = Current Volume ÷ Average Volume (use 15 day moving avg)
+#the average uses the 15 days BEFORE the current day, so a spike cannot dilute its own average
 
-#plan: create 3 models. 1 to calculate number of NoRisk. 1 to calculate number ModRisk. 1 to calculate number HighRisk.
-#use those numbers to calculate probability of each. 
+risk_data <- optt_model_tidy |>
+  mutate(
+    #price drop (as a fraction) from the previous day's adjusted close, gains count as 0
+    price_drop = pmax(0, -(Adjusted / lag(Adjusted) - 1)),
+    vol_avg15 = lag(rollmean(Volume, k = 15, fill = NA, align = "right")),
+    vol_multiple = Volume / vol_avg15,
+    risk_level = case_when(
+      is.na(price_drop) | !is.finite(vol_multiple) ~ NA_character_,
+      price_drop > 0.07 | vol_multiple > 2 ~ "Level 3",
+      price_drop >= 0.03 | vol_multiple >= 1.25 ~ "Level 2",
+      TRUE ~ "Level 1"
+    ),
+    risk_level = factor(risk_level, levels = c("Level 1", "Level 2", "Level 3"), ordered = TRUE),
+    log_vol_multiple = log(vol_multiple),
+    #predictors are lagged one day so the model only uses information available before the event day
+    rsi_lag = lag(rsi),
+    macd_hist_lag = lag(macd_hist),
+    ATR_lag = lag(ATR),
+    price_drop_lag = lag(price_drop),
+    log_vol_multiple_lag = lag(log_vol_multiple)
+  ) |>
+  filter(!is.na(risk_level),
+         is.finite(rsi_lag), is.finite(macd_hist_lag), is.finite(ATR_lag),
+         is.finite(price_drop_lag), is.finite(log_vol_multiple_lag))
 
+risk_model <- MASS::polr(risk_level ~ rsi_lag + macd_hist_lag + ATR_lag + price_drop_lag + log_vol_multiple_lag,
+                         data = risk_data, Hess = TRUE)
+summary(risk_model)
+
+#polr does not report p-values, so calculate them from the t values
+risk_coefs <- coef(summary(risk_model))
+cbind(risk_coefs, p_value = 2 * pnorm(abs(risk_coefs[, "t value"]), lower.tail = FALSE))
+
+#odds ratios
+exp(coef(risk_model))
 ```
-
 
 # Factor Model
 ```{}
@@ -664,18 +733,25 @@ factor <- MODEL MODEL MODEL
 
 # break up the data
 ```{r}
-#going to measure price by adjusted close price, so that is my metric of choice to split by
+#going to measure price by adjusted close price, so that is my metric of choice
+#predicting the next day's percent change in adjusted close: the predictors come from day t
+#and the outcome from day t+1, so no predictor contains the outcome
+optt_ml <- optt_model_tidy |>
+  mutate(next_return = (lead(Adjusted) / Adjusted - 1) * 100) |>
+  filter(!is.na(next_return)) #last day has no next day
+
 # split data for training and testing
 #70% train, 30% test
+#stock data is a time series, so the split is chronological (oldest 70% to train, newest 30%
+#to test). A random split would train on days that come after the days it is tested on.
 
 #install.packages("caret")
 library(caret)
 
 set.seed(10092026)
-train_index <- createDataPartition(optt_model_tidy$Adjusted, p = 0.7, list = FALSE)
-
-Train <- optt_model_tidy[train_index, ]
-Test <- optt_model_tidy[-train_index, ]
+n_train <- floor(0.7 * nrow(optt_ml))
+Train <- optt_ml[1:n_train, ]
+Test <- optt_ml[(n_train + 1):nrow(optt_ml), ]
 
 summary(Train)
 summary(Test)
@@ -683,17 +759,47 @@ summary(Test)
 
 ## Ridge Regression (results don't mean much now, acts as a stabiliser in the weighted model)
 
-```{}
-ridge <- MODEL MODEL MODEL
+```{r}
+# NOTE: NEED TO FIX TO BE TRAINED AND TESTED ON DIFFERENT SPLITS. NEED TO CACLUALTE RMSE FOR TEST AND TRAIN --> COMPARE. VIEW NON-ZERO COEFFICIENTS AT lambda.min
+
+
+x <- makeX(optt_ml[, c("rsi", "macd_hist", "shares_outstanding", "Volume", "Adjusted")], na.impute = TRUE)
+y <- log(optt_ml$ATR)
+
+ridge <- glmnet(x, y, alpha = 0)
+
+plot(ridge, xvar = "lambda", label = TRUE)
+
+#Perform 10-fold cross-validation
+set.seed(11142026) # For reproducibility
+cv_ridge <- cv.glmnet(x, y, alpha = 0, nfolds = 10)
+
+# Plot cross-validation results
+plot(cv_ridge)
+
+# Extract the optimal lambda values
+best_lambda <- cv_ridge$lambda.min
+cat("Best Lambda:", best_lambda, "\n")
+
+# Alternatively, you can use lambda.1se for a more regularized, simpler model
+lambda_1se <- cv_ridge$lambda.1se
+
+# Extract coefficients at the optimal lambda
+final_coefficients <- coef(cv_ridge, s = "lambda.min")
+print(final_coefficients)
+
+# Make predictions on new data (using the training matrix 'x' here as an example)
+predictions <- predict(cv_ridge, s = "lambda.min", newx = x)
+head(predictions)
 ```
 
 ## Random Forest
 
-```{}
+```{r}
 install.packages("randomForest")
 library(randomForest)
--bootstrap code-
--use complexity parameters: min_samples_split, max_depth, n_trees (10k)-
+
+#use Train dataset
 
 ```
 
