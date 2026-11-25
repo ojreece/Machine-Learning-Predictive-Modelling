@@ -34,10 +34,19 @@ library("TTR")
 library("kableExtra")
 #install.packages("ggplot2") #clean visualisations
 library("ggplot2")
-install.packages("glmnet")
+#install.packages("glmnet") #ridge regression
 library("glmnet")
-install.packages("randomForest")
+#install.packages("randomForest")
 library(randomForest)
+#install.packages("sandwich") #Newey-West (HAC) standard errors
+library(sandwich)
+#install.packages("lmtest") #coeftest, used with sandwich
+library(lmtest)
+#install.packages("brant") #Brant test of the proportional odds assumption (called with brant::)
+
+#MASS (loaded earlier in some sessions) masks dplyr::select, which breaks every select() call.
+#This makes select() always mean dplyr's, whatever else is loaded. MASS functions are called with MASS::
+select <- dplyr::select
 
 ```
 
@@ -90,7 +99,7 @@ it being right-skewed with a median of 7,710 vs a mean of 1,974,392.
 
 I will use an ordinal logistic regression model for risk analysis, using a "risk event"
 severity level as the dependent variable. The risk event will be triggered when a significant
-price drop or sell-side volume spike occurs, or both. The model is ordinal in nature,
+price drop or abnormal volume spike (in either direction) occurs, or both. The model is ordinal in nature,
 with 3 "severity" tiers, defined as:
 
 - **Level 1** -> No Risk Event: Price Drop < 3% and Volume Multiple < 1.25
@@ -118,8 +127,9 @@ algorithms possess. Both algorithms function by breaking the data down into rect
 cross sections based on real historic data. Thus, these models will never predict
 a future dollar price that exceeds the upper and lower bounds of the data - a
 reality that does not exist in the stock market. As a solution, I will predict
-returns using a calculated percent change metric as the outcome variable. This
-percent change will be calculated using adjusted closing price
+returns using the next-day log return as the outcome variable (the log of tomorrow's
+adjusted closing price divided by today's, in percent). Log returns are used because they are
+symmetric and far less sensitive to extreme days than simple percent changes
 
 To conclude, I will compare the effectiveness of the 3 ML models using error scores
 to determine which stand-alone algorithm performed best.
@@ -181,10 +191,19 @@ are non-trading days, meaning no data can be collected on those days.
 #pull OPTT ticker data for all time since going public.
 #date format: YYYY-MM-DD
 
-optt <- tq_get("OPTT",
-               get = "stock.prices",
-               from = "2007-04-25", #went public on NASDAQ April 25th 2007
-               to = "2026-06-21") #at time of download, update as needed
+#the downloaded prices are cached so every render uses exactly the same data (Yahoo revises
+#adjusted prices over time). Delete OPTT_Prices_Cache.csv to download a fresh copy.
+price_cache <- "OPTT_Prices_Cache.csv"
+
+if (file.exists(price_cache)) {
+  optt <- read_csv(price_cache, show_col_types = FALSE)
+} else {
+  optt <- tq_get("OPTT",
+                 get = "stock.prices",
+                 from = "2007-04-25", #went public on NASDAQ April 25th 2007
+                 to = "2026-06-21") #at time of download, update as needed
+  write_csv(optt, price_cache)
+}
 ```
 
 ```{r}
@@ -199,6 +218,128 @@ summary(optt)
 
 ```{r}
 summary(optt$adjusted / optt$close)
+```
+
+Before computing any indicators, I check the price history for impossible one-day jumps.
+Yahoo Finance adjusts old prices for stock splits, but a split that is only partly adjusted, or a bad
+price record, shows up as a one-day move of several hundred percent that would dominate every error
+score downstream. The check below lists every day where the adjusted close more than triples or falls
+by more than two thirds, and sorts each one into one of three kinds, using that day's trading volume
+to tell them apart. A real split changes the price and the number of shares traded in opposite
+directions, so price times volume stays about the same. A **split** persists, is within 15% of a
+standard split ratio, and has that opposite-moving volume: prices before that day are rescaled to the
+post-split basis and Volume is rescaled the opposite way. A **spike** is followed within five trading
+days by a jump back to about the original level, which makes it a one-off bad record, and the affected
+days are removed. Anything else, such as a one-day jump that comes with a huge surge in volume, is a
+**real move** and is kept. Finally, open, high and low are scaled by the adjusted-to-close ratio so that
+every price in the dataset, and every indicator built from it, sits on the same adjusted basis.
+
+```{r}
+#| output: true
+
+#price integrity check: flag days where the adjusted close more than triples (+200%)
+#or falls by more than two thirds (-67%)
+price_check <- optt |>
+  mutate(row = row_number(), daily_ratio = adjusted / lag(adjusted))
+
+extreme_days <- price_check |>
+  filter(daily_ratio > 3 | daily_ratio < 1 / 3) |>
+  select(row, date, close, adjusted, daily_ratio)
+
+#standard split ratios (reverse or forward). A flagged jump within 15% of one of these
+#is treated as an unadjusted split
+split_ratios <- c(2, 3, 4, 5, 8, 10, 15, 20, 25, 30, 40, 50, 100)
+
+#a one-off bad record shows up as a big jump followed within 5 trading days by a jump back to about
+#the original level (the two jumps roughly cancel). That is a bad record, not a split
+extreme_days$spike_end_row <- NA_integer_
+for (k in seq_len(nrow(extreme_days))) {
+  later <- which(extreme_days$row > extreme_days$row[k] &
+                   extreme_days$row <= extreme_days$row[k] + 5 &
+                   sign(log(extreme_days$daily_ratio)) == -sign(log(extreme_days$daily_ratio[k])) &
+                   abs(log(extreme_days$daily_ratio[k] * extreme_days$daily_ratio)) < log(2))
+  if (length(later) > 0) extreme_days$spike_end_row[k] <- extreme_days$row[later[1]]
+}
+
+#a real split moves price and share volume in opposite directions, so (price ratio) x (volume ratio)
+#stays about 1. Volume ratio = the jump day's volume relative to the median of the 5 days before it
+extreme_days$volume_ratio <- sapply(extreme_days$row, function(r) {
+  prior <- optt$volume[max(1, r - 5):(r - 1)]
+  optt$volume[r] / max(median(prior), 1)
+})
+
+extreme_days <- extreme_days |>
+  mutate(
+    is_spike = !is.na(spike_end_row),
+    is_spike_end = row %in% spike_end_row, #the jump back at the end of a spike
+    jump_size = if_else(daily_ratio > 1, daily_ratio, 1 / daily_ratio),
+    nearest_split = map_dbl(jump_size, function(j) split_ratios[which.min(abs(j / split_ratios - 1))]),
+    dollar_ratio = daily_ratio * volume_ratio,
+    volume_confirms_split = dollar_ratio > 0.2 & dollar_ratio < 5,
+    is_split = !is_spike & !is_spike_end & abs(jump_size / nearest_split - 1) < 0.15 & volume_confirms_split,
+    #prices BEFORE the jump are rescaled to the post-jump basis:
+    #a reverse split (price jumps up) multiplies them, a forward split divides them
+    rescale_factor = if_else(daily_ratio > 1, nearest_split, 1 / nearest_split),
+    treatment = case_when(
+      is_spike | is_spike_end ~ "bad record (spike), removed",
+      is_split ~ "unadjusted split, rescaled",
+      TRUE ~ "real move, kept"
+    )
+  )
+
+extreme_days |>
+  select(date, adjusted, daily_ratio, volume_ratio, dollar_ratio, treatment) |>
+  kable(digits = 3) |>
+  kable_styling(font_size = 10)
+```
+
+```{r}
+#first remove the bad records: the rows from the start of each spike up to (not including)
+#the day of the jump back
+spike_rows <- unlist(lapply(which(extreme_days$is_spike), function(k) {
+  extreme_days$row[k]:(extreme_days$spike_end_row[k] - 1)
+}))
+if (length(spike_rows) > 0) optt <- optt[-spike_rows, ]
+
+#then rescale prices (and Volume the opposite way) before each unadjusted split
+adj_factor <- rep(1, nrow(optt))
+for (i in which(extreme_days$is_split)) {
+  before_jump <- optt$date < extreme_days$date[i]
+  adj_factor[before_jump] <- adj_factor[before_jump] * extreme_days$rescale_factor[i]
+}
+
+optt <- optt |>
+  mutate(
+    across(c(open, high, low, close, adjusted), ~ .x * adj_factor),
+    volume = volume / adj_factor,
+    #put open/high/low/close on the adjusted basis too, so every indicator is built
+    #from one consistent price series
+    price_basis = adjusted / close,
+    open = open * price_basis,
+    high = high * price_basis,
+    low = low * price_basis,
+    close = adjusted
+  ) |>
+  select(-price_basis)
+```
+
+```{r}
+#| output: true
+
+#days classed as real moves are kept (a one-day jump with a matching surge in volume is a genuine event).
+#after the cleaning, the only days still flagged should be those real moves
+real_moves <- extreme_days$date[extreme_days$treatment == "real move, kept"]
+remaining <- optt |>
+  mutate(daily_ratio = adjusted / lag(adjusted)) |>
+  filter(daily_ratio > 3 | daily_ratio < 1 / 3)
+unexpected <- remaining |> filter(!(date %in% real_moves))
+if (nrow(unexpected) > 0) warning("Unexpected extreme price jumps remain after cleaning: inspect `unexpected`")
+
+cat("Days flagged:", nrow(extreme_days),
+    "| splits rescaled:", sum(extreme_days$treatment == "unadjusted split, rescaled"),
+    "| spike rows removed:", length(spike_rows),
+    "| real moves kept:", length(real_moves),
+    "| unexpected jumps remaining:", nrow(unexpected), "\n")
 ```
 
 ```{r}
@@ -438,9 +579,10 @@ gauge the internal health of the company. Specifically, I focus on Outstanding S
 Net Loss, and Revenue. The original CSVs I had scraped from SEC filings using Google's
 NotebookLM (`order_backlog.csv` and `OPTT_Data.csv`) were lost, and were not recoverable
 from local backups. Rather than re-scrape SEC filings by hand, I instead source the same
-underlying figures from a public financial-data aggregator that itself compiles them
-from OPTT's filed 10-Ks/10-Qs (see References), which lets me rebuild the alternate
-dataset transparently and reproducibly.
+underlying figures directly from OPTT's filed 10-Ks through the SEC's XBRL data service
+(see References). An earlier version of this dataset used a third-party aggregator, but
+checking it against the filings showed that many of its figures did not match the 10-Ks,
+so it was replaced. This lets me rebuild the alternate dataset transparently and reproducibly.
 
 While I was rebuilding this dataset, I also reconsidered the Backlog-Sales Ratio I had
 originally planned to use. As noted earlier, order backlog was not reported by OPTT
@@ -450,16 +592,16 @@ fiscal year without exception - and it more directly tests the question I actual
 care about: whether the January 2026 U.S. Coast Guard/DHS contract is translating into
 top-line recovery. I therefore drop the Backlog-Sales Ratio entirely in favour of Revenue.
 
-Similarly, the aggregator I use reports **Net Loss** (the income-statement bottom line)
+Similarly, the figures I use report **Net Loss** (the income-statement bottom line)
 rather than Operating Loss specifically. I use Net Loss instead of Operating Loss. This is not simply a
 data-availability compromise: OPTT's bottom line is also driven by large non-cash
 fair-value adjustments on warrants and other derivative liabilities issued as part of
 its dilutive financings, so Net Loss captures more of the dilution-and-risk story the
 Abstract describes than Operating Loss would.
 
-Outstanding Shares are only reliably available from fiscal 2019 onward - before that,
-the aggregator's series is too sparse to trust, and I leave those years as `NA` rather
-than fabricate a number. Revenue and Net Loss are available back to fiscal 2012, which
+Outstanding Shares are only used from fiscal 2019 onward - before that, OPTT's reverse
+stock splits mean the cover-page share counts are not on a comparable basis, and I leave
+those years as `NA` rather than fabricate a number. Revenue and Net Loss are available back to fiscal 2012, which
 conveniently lines up with the Abstract's own framing of 2012 as when OPTT's dilution
 and loss problems began, so I restrict the alternate dataset to fiscal years 2012-2026.
 OPTT's fiscal year runs May-April, so "fiscal 2012" covers May 2011 - April 2012, and
@@ -467,19 +609,26 @@ so on.
 
 ```{r}
 #Annual fundamentals for OPTT, fiscal years 2012-2026 (FY ends April 30).
-#Sourced from a public aggregator of OPTT's SEC filings (companiesmarketcap.com,
-#pulled 2026-09-18) since the original scraped CSVs were lost - see References.
-#Outstanding Shares only goes back to FY2019; earlier years are left NA rather
-#than guessed at.
+#Sourced directly from OPTT's 10-K filings through the SEC XBRL API
+#(data.sec.gov/api/xbrl/companyconcept/CIK0001378140), retrieved 2026-11-25 - see References.
+#revenue and net_loss: the value reported for that fiscal year in the most recent 10-K that
+#  reports it (FY2019 revenue is the later 600,000; it was first reported as 632,000).
+#shares_outstanding: the cover-page share count in that fiscal year's 10-K (as of the filing date).
+#  Only FY2019 onward is used: earlier counts are not on a comparable basis because of OPTT's
+#  reverse stock splits, so earlier years are left NA rather than guessed at.
+#filed_date: the date that fiscal year's 10-K was filed, i.e. when the figures became public.
 
 alt_data_annual <- tibble(
   fiscal_year = 2012:2026,
-  revenue = c(4.59, 1.53, 3.99, 1.09, 0.69, 0.53, 0.66,
-              1.32, 1.15, 1.60, 2.50, 4.93, 6.11, 3.43, 3.43) * 1e6,
-  net_loss = c(-16.41, -13.88, -14.11, -14.38, -11.71, -11.18, -14.05,
-               -11.76, -11.70, -19.80, -25.03, -31.62, -20.99, -35.27, -35.27) * 1e6,
+  revenue = c(5738506, 3616129, 1498892, 4105424, 704820, 843000, 511000,
+              600000, 1682000, 1206000, 1759000, 2732000, 5525000, 5861000, 3737000),
+  net_loss = c(-15140502, -14681837, -10969192, -13114552, -13129000, -9486000, -10157000,
+               -12246000, -10352000, -14760000, -18874000, -26326000, -27483000, -24466000, -48915000),
   shares_outstanding = c(rep(NA_real_, 7),
-                         6.25, 20.09, 52.46, 55.89, 58.78, 108.3, 183.5, 195.5) * 1e6
+                         5771747, 17120565, 52458011, 55881861, 58730917, 92708981, 177542775, 270138823),
+  filed_date = as.Date(c("2012-07-13", "2013-07-12", "2014-07-29", "2015-07-06", "2016-07-15",
+                         "2017-07-14", "2018-07-17", "2019-07-22", "2020-06-29", "2021-07-19",
+                         "2022-07-13", "2023-07-28", "2024-07-25", "2025-07-24", "2026-08-19"))
 )
 
 head(alt_data_annual)
@@ -525,7 +674,13 @@ enhancement to model time-varying volatility in the disaggregated residuals, as 
 originally hoped for, is not something `tempdisagg` supports out of the box, so it
 remains a possible future refinement rather than something implemented here.
 
+The two chunks below are kept as a record of this abandoned approach and are no longer
+evaluated (`eval: false`), because the quarterly series is not used by any model and the
+annual figures it was built from have since been replaced with figures taken directly from
+OPTT's 10-Ks.
+
 ```{r}
+#| eval: false
 #build the fiscal calendar on the main (daily) data, without altering optt_tidy itself
 optt_fiscal_calendar <- optt_tidy |>
   select(Year, Month, Volume) |>
@@ -552,6 +707,7 @@ optt_quarterly_indicator <- optt_fiscal_calendar |>
 ```
 
 ```{r}
+#| eval: false
 library(tempdisagg)
 
 #low-frequency (annual) series, one point per fiscal year
@@ -602,18 +758,18 @@ public until OPTT files its 10-K, which happens a couple of months after the Apr
 year-end.
 
 As a solution, each trading day instead takes the most recent annual figures that had
-actually been filed by that date. For simplicity, I assume each fiscal year's 10-K becomes
-available on July 15th of that calendar year (roughly 75 days after year-end). This is a
+actually been filed by that date. Each fiscal year's figures become available on the date its 10-K
+was actually filed with the SEC (between late June and late August, see References). This is a
 step function, which mirrors how the market actually receives this information - a filed
-number that is valid until the next filing. That being said, trading days before July 15th,
-2012 have no fundamentals, and the FY2026 figures only become available on July 15th, 2026,
+number that is valid until the next filing. That being said, trading days before July 13th,
+2012 have no fundamentals, and the FY2026 figures only become available on August 19th, 2026,
 after the last day of data (June 21st, 2026), meaning the most recent trading days carry
 the FY2025 figures.
 
 ```{r}
-#date each fiscal year's figures become public (10-K filed roughly 75 days after April 30th)
+#date each fiscal year's figures become public (the date its 10-K was filed)
 alt_data_annual <- alt_data_annual |>
-  mutate(available_from = as.Date(paste0(fiscal_year, "-07-15")))
+  mutate(available_from = filed_date)
 ```
 
 With the availability dates attached, I join the figures onto every trading day, then drop
@@ -635,6 +791,14 @@ head(optt_model_tidy)
 summary(optt_model_tidy)
 
 ```
+
+```{r}
+#keep only the data after June 2016: Yahoo's trading volume before then is on a much smaller scale
+#(about 100-1,000 shares a day to May 2016, then tens of thousands to millions), which would distort
+#every volume-based variable. The 1 June 2016 price jump itself is real and is not the reason for the cut.
+optt_model_tidy <- optt_model_tidy |>
+  filter(Date >= as.Date("2016-07-01"))
+```
 # Problem - shares outstanding has MANY n/a values --> can't really be used in modelling as is. 
 
 # Historical Analysis:
@@ -645,9 +809,23 @@ summary(optt_model_tidy)
 #obv is left out (it is built from Volume, the outcome) and so is macd_signal (macd_hist is already
 #macd - signal). Price, shares and net loss are trending levels, so price and shares are logged and
 #net loss is put in millions. Zero-volume days are dropped as log(0) is undefined.
+#shares_outstanding and net_loss only exist from the FY2019 10-K onward, so lm() would silently drop every
+#earlier day. The sample is built explicitly here so its size and dates can be reported.
+ols_data <- optt_model_tidy |>
+  filter(Volume > 0, !is.na(shares_outstanding), !is.na(net_loss))
+
 ols_volume <- lm(log(Volume) ~ rsi + macd_hist + log(shares_outstanding) + I(net_loss / 1e6) + log(Adjusted),
-          data = filter(optt_model_tidy, Volume > 0))
+          data = ols_data)
 summary(ols_volume)
+
+#daily data are autocorrelated, so the ordinary standard errors above are too small.
+#Newey-West (HAC) standard errors (20 lags, about one trading month) are used for inference instead.
+ols_volume_hac <- coeftest(ols_volume, vcov. = NeweyWest(ols_volume, lag = 20, prewhite = FALSE))
+ols_volume_hac
+
+#the sample actually used
+cat("OLS (log Volume) sample:", nobs(ols_volume), "days,",
+    format(min(ols_data$Date)), "to", format(max(ols_data$Date)), "\n")
 ```
 
 ```{r}
@@ -658,17 +836,33 @@ plot(ols_volume)
 ```{r}
 
 #same changes as above; obv is cumulative (a trending level) so it is left out here too, and Volume is logged
-ols_price <- lm(log(ATR) ~ rsi + macd_hist + log(shares_outstanding) + I(net_loss / 1e6) + log(Volume) + log(Adjusted),
-          data = filter(optt_model_tidy, Volume > 0, ATR > 0))
-summary(ols_price)
+#the model is named ols_atr because it explains the (log) ATR, a volatility measure, not price
+ols_data_atr <- optt_model_tidy |>
+  filter(Volume > 0, ATR > 0, !is.na(shares_outstanding), !is.na(net_loss))
 
-## shares_outstanding and net_loss are currently NA
+ols_atr <- lm(log(ATR) ~ rsi + macd_hist + log(shares_outstanding) + I(net_loss / 1e6) + log(Volume) + log(Adjusted),
+          data = ols_data_atr)
+summary(ols_atr)
+
+#ATR is a 14-day rolling mean, so neighbouring days share most of their data: HAC standard errors again
+ols_atr_hac <- coeftest(ols_atr, vcov. = NeweyWest(ols_atr, lag = 20, prewhite = FALSE))
+ols_atr_hac
+
+cat("OLS (log ATR) sample:", nobs(ols_atr), "days,",
+    format(min(ols_data_atr$Date)), "to", format(max(ols_data_atr$Date)), "\n")
 ```
 
 ```{r}
 #check residuals
-plot(ols_price)
+plot(ols_atr)
 ```
+
+The coefficients in both regressions describe associations between same-day values, not
+predictions or causal effects. Both models are fitted only on the days from the FY2019 10-K
+onward, since that is when share counts become usable, and inference uses Newey-West standard
+errors because daily observations are autocorrelated. Net loss and shares outstanding change only
+once a year, so within this sample they largely act as a marker of the time period; they are
+included as controls and I do not interpret their coefficients as effects.
 
 # Risk Modelling:
 
@@ -678,7 +872,9 @@ plot(ols_price)
 #ordinal logistic regression using MASS::polr (called with MASS:: so it does not mask dplyr::select)
 
 #define the levels and metrics:
-#The risk event will be triggered when a significant price drop or sell-side volume spike occurs, or both. 
+#The risk event will be triggered when a significant price drop or abnormal volume spike (in either direction)
+#occurs, or both. Volume Multiple has no direction, so the volume trigger flags unusually high activity on
+#any day: this is an abnormal-activity risk indicator, not a pure sell-side measure.
 
 #- **Level 1** -> No Risk Event: Price Drop < 3% and Volume Multiple < 1.25
 # **Level 2** -> Moderate Risk Event: Price Drop between 3% - 7% (inclusive) or Volume
@@ -688,41 +884,152 @@ plot(ols_price)
 #volume multiple = Current Volume ÷ Average Volume (use 15 day moving avg)
 #the average uses the 15 days BEFORE the current day, so a spike cannot dilute its own average
 
-risk_data <- optt_model_tidy |>
-  mutate(
-    #price drop (as a fraction) from the previous day's adjusted close, gains count as 0
-    price_drop = pmax(0, -(Adjusted / lag(Adjusted) - 1)),
-    vol_avg15 = lag(rollmean(Volume, k = 15, fill = NA, align = "right")),
-    vol_multiple = Volume / vol_avg15,
-    risk_level = case_when(
-      is.na(price_drop) | !is.finite(vol_multiple) ~ NA_character_,
-      price_drop > 0.07 | vol_multiple > 2 ~ "Level 3",
-      price_drop >= 0.03 | vol_multiple >= 1.25 ~ "Level 2",
-      TRUE ~ "Level 1"
-    ),
-    risk_level = factor(risk_level, levels = c("Level 1", "Level 2", "Level 3"), ordered = TRUE),
-    log_vol_multiple = log(vol_multiple),
-    #predictors are lagged one day so the model only uses information available before the event day
-    rsi_lag = lag(rsi),
-    macd_hist_lag = lag(macd_hist),
-    ATR_lag = lag(ATR),
-    price_drop_lag = lag(price_drop),
-    log_vol_multiple_lag = lag(log_vol_multiple)
-  ) |>
-  filter(!is.na(risk_level),
-         is.finite(rsi_lag), is.finite(macd_hist_lag), is.finite(ATR_lag),
-         is.finite(price_drop_lag), is.finite(log_vol_multiple_lag))
+#the data are built in a function so the cut-offs can be varied in the sensitivity check below.
+#the defaults are the thresholds above
+build_risk_data <- function(drop_mod = 0.03, drop_high = 0.07, vol_mod = 1.25, vol_high = 2) {
+  optt_model_tidy |>
+    mutate(
+      #price drop (as a fraction) from the previous day's adjusted close, gains count as 0
+      price_drop = pmax(0, -(Adjusted / lag(Adjusted) - 1)),
+      vol_avg15 = lag(rollmean(Volume, k = 15, fill = NA, align = "right")),
+      vol_multiple = Volume / vol_avg15,
+      risk_level = case_when(
+        is.na(price_drop) | !is.finite(vol_multiple) ~ NA_character_,
+        price_drop > drop_high | vol_multiple > vol_high ~ "Level 3",
+        price_drop >= drop_mod | vol_multiple >= vol_mod ~ "Level 2",
+        TRUE ~ "Level 1"
+      ),
+      risk_level = factor(risk_level, levels = c("Level 1", "Level 2", "Level 3"), ordered = TRUE),
+      log_vol_multiple = log(vol_multiple),
+      #predictors are lagged one day so the model only uses information available before the event day
+      rsi_lag = lag(rsi),
+      macd_hist_lag = lag(macd_hist),
+      ATR_lag = lag(ATR),
+      price_drop_lag = lag(price_drop),
+      log_vol_multiple_lag = lag(log_vol_multiple)
+    ) |>
+    filter(!is.na(risk_level),
+           is.finite(rsi_lag), is.finite(macd_hist_lag), is.finite(ATR_lag),
+           is.finite(price_drop_lag), is.finite(log_vol_multiple_lag))
+}
 
-risk_model <- MASS::polr(risk_level ~ rsi_lag + macd_hist_lag + ATR_lag + price_drop_lag + log_vol_multiple_lag,
-                         data = risk_data, Hess = TRUE)
+risk_data <- build_risk_data()
+
+risk_formula <- risk_level ~ rsi_lag + macd_hist_lag + ATR_lag + price_drop_lag + log_vol_multiple_lag
+risk_model <- MASS::polr(risk_formula, data = risk_data, Hess = TRUE)
 summary(risk_model)
 
 #polr does not report p-values, so calculate them from the t values
+#(these assume independent days, so they are too optimistic: see the block bootstrap below)
 risk_coefs <- coef(summary(risk_model))
 cbind(risk_coefs, p_value = 2 * pnorm(abs(risk_coefs[, "t value"]), lower.tail = FALSE))
 
 #odds ratios
 exp(coef(risk_model))
+```
+
+Risk events cluster in time, so the standard errors that `polr` reports (which treat every day as
+independent) are too small. The block bootstrap below resamples 20-day blocks of consecutive days, which
+keeps that clustering, and the Brant test checks the proportional odds assumption that an ordinal
+logistic model relies on.
+
+```{r}
+#| output: true
+
+#moving-block bootstrap standard errors: resample 20-day blocks of consecutive days
+set.seed(11142026)
+n_risk <- nrow(risk_data)
+block_len <- 20
+n_boot <- 200
+boot_coefs <- matrix(NA_real_, nrow = n_boot, ncol = length(coef(risk_model)))
+
+for (b in seq_len(n_boot)) {
+  starts <- sample(seq_len(n_risk - block_len + 1), size = ceiling(n_risk / block_len), replace = TRUE)
+  idx <- unlist(lapply(starts, function(s) s:(s + block_len - 1)))[seq_len(n_risk)]
+  fit_b <- tryCatch(MASS::polr(risk_formula, data = risk_data[idx, ], Hess = FALSE),
+                    error = function(e) NULL)
+  if (!is.null(fit_b)) boot_coefs[b, ] <- coef(fit_b)
+}
+
+boot_se <- apply(boot_coefs, 2, sd, na.rm = TRUE)
+risk_boot_table <- tibble(
+  term = names(coef(risk_model)),
+  estimate = as.numeric(coef(risk_model)),
+  boot_se = boot_se,
+  z = estimate / boot_se,
+  p_value = 2 * pnorm(abs(z), lower.tail = FALSE)
+)
+
+risk_boot_table |>
+  kable(digits = 4) |>
+  kable_styling(font_size = 10)
+
+#Brant test of the proportional odds assumption (small p-values mean the assumption is doubtful)
+if (requireNamespace("brant", quietly = TRUE)) {
+  brant::brant(risk_model)
+} else {
+  cat("Install the 'brant' package to run the proportional odds test.\n")
+}
+```
+
+The cut-offs (3% and 7% price drops, 1.25x and 2x volume) are conventions I chose, not estimated values, so
+the model is refit under two other sets of cut-offs to check the results are not an artefact of them. It is
+also scored out of sample: fitted on the first 70% of days and used to classify the last 30%, then compared
+with always predicting the most common level.
+
+```{r}
+#| output: true
+
+#sensitivity of the odds ratios to the cut-offs: (drop_mod, drop_high, vol_mod, vol_high)
+threshold_sets <- list(
+  Baseline = c(0.03, 0.07, 1.25, 2),
+  Tighter = c(0.02, 0.05, 1.5, 3),
+  Wider = c(0.05, 0.10, 1.5, 2.5)
+)
+
+sensitivity <- map_dfr(names(threshold_sets), function(nm) {
+  th <- threshold_sets[[nm]]
+  d <- build_risk_data(th[1], th[2], th[3], th[4])
+  m <- MASS::polr(risk_formula, data = d, Hess = TRUE)
+  tibble(thresholds = nm, term = names(coef(m)), odds_ratio = as.numeric(exp(coef(m))))
+})
+
+sensitivity |>
+  pivot_wider(names_from = thresholds, values_from = odds_ratio) |>
+  kable(digits = 3) |>
+  kable_styling(font_size = 10)
+
+#out-of-sample check: fit on the first 70% of days, classify the last 30%
+n_fit <- floor(0.7 * n_risk)
+risk_fit_set <- risk_data[1:n_fit, ]
+risk_test_set <- risk_data[(n_fit + 1):n_risk, ]
+
+risk_model_oos <- MASS::polr(risk_formula, data = risk_fit_set, Hess = TRUE)
+risk_pred <- predict(risk_model_oos, newdata = risk_test_set)
+
+majority_class <- names(which.max(table(risk_fit_set$risk_level)))
+actual_level <- as.character(risk_test_set$risk_level)
+cat("Out-of-sample accuracy:", round(mean(as.character(risk_pred) == actual_level), 3),
+    "| always predicting", majority_class, ":", round(mean(actual_level == majority_class), 3), "\n")
+```
+
+# Contract Event Study (Placeholder)
+
+This section is intentionally unfinished. The Abstract asks whether the January 6th, 2026 contract
+has begun to aid OPTT's recovery, but nothing in the document tests that yet. The chunk below only records
+the planned design and is not evaluated.
+
+```{r}
+#| eval: false
+
+#PLANNED DESIGN (not implemented):
+#event date: 2026-01-06 (announcement of the U.S. Department of Homeland Security / Coast Guard contract)
+#estimation window: e.g. the 120 trading days before the announcement, to estimate normal behaviour
+#event window: e.g. the days from -1 to +20 around the announcement, and a longer post-announcement window
+#outcomes: abnormal returns (actual log return - expected log return), abnormal log(Volume), change in ATR
+#control: a comparison group such as a small-cap clean-energy / maritime ETF, to separate OPTT-specific
+#  effects from market-wide moves
+#caveat: the price data ends 2026-06-21, so the post-contract window is only about 5 months
 ```
 
 # Factor Model
@@ -734,16 +1041,27 @@ factor <- MODEL MODEL MODEL
 # Forecasting/Prediction ML Models
 
 # break up the data
+
+I predict the next day's log return, using the same outcome, the same rows and the same error
+measures for every model so the results can be compared directly. The data are split
+chronologically into three parts: Train (oldest 60%), Valid (next 20%) and Test (newest 20%). Models
+are fitted on Train, and Valid is used to choose their settings (the ridge penalty, the forest's
+`mtry` and `nodesize`, and the number of boosting rounds). Each model is then refit on Train and Valid
+together and scored once on Test, so Test plays no part in any decision. Next-day returns are very hard
+to predict, so every model is shown next to a baseline that always predicts the training average, and a
+model only adds value if it beats that baseline.
+
 ```{r}
 #going to measure price by adjusted close price, so that is my metric of choice
-#predicting the next day's percent change in adjusted close: the predictors come from day t
+#predicting the next day's log return (in percent) of adjusted close: the predictors come from day t
 #and the outcome from day t+1, so no predictor contains the outcome
+#log returns are symmetric and far less sensitive to extreme days than simple percent changes
 optt_ml <- optt_model_tidy |>
   mutate(
-    #outcome: next day's percent change in adjusted close
-    next_return = (lead(Adjusted) / Adjusted - 1) * 100,
-    #today's percent change, and the 5 days before it (all known at the close of day t)
-    return_t0 = (Adjusted / dplyr::lag(Adjusted, 1) - 1) * 100,
+    #outcome: next day's log return, in percent
+    next_return = log(lead(Adjusted) / Adjusted) * 100,
+    #today's log return, and the 5 days before it (all known at the close of day t)
+    return_t0 = log(Adjusted / dplyr::lag(Adjusted, 1)) * 100,
     return_t1 = dplyr::lag(return_t0, 1),
     return_t2 = dplyr::lag(return_t0, 2),
     return_t3 = dplyr::lag(return_t0, 3),
@@ -753,107 +1071,158 @@ optt_ml <- optt_model_tidy |>
     #+1 avoids dividing by zero or taking the log of zero on zero volume days
     vol_ratio = log((Volume + 1) / (rollmean(Volume, k = 20, fill = NA, align = "right") + 1))
   ) |>
-  #keep only the outcome and the predictors being used. Dates and raw price levels are dropped:
-  #dates let trees memorise the time period, and raw prices are non-stationary
-  select(next_return, return_t0, return_t1, return_t2, return_t3, return_t4, return_t5,
+  #keep only the outcome and the predictors being used. Raw prices are dropped because they are
+  #non-stationary, and the date is dropped (below) so trees cannot memorise the time period
+  select(Date, next_return, return_t0, return_t1, return_t2, return_t3, return_t4, return_t5,
          rsi, macd_hist, ATR, true_range, vol_ratio) |>
   #drop rows with NA from the lags/rolling windows and the last day (no next day)
   na.omit()
 
-# split data for training and testing
-#70% train, 30% test
-#stock data is a time series, so the split is chronological (oldest 70% to train, newest 30%
-#to test). A random split would train on days that come after the days it is tested on.
+#dates are kept aside for reporting, then dropped so they cannot be used as a predictor
+ml_dates <- optt_ml$Date
+optt_ml <- optt_ml |> select(-Date)
 
-#install.packages("caret")
-library(caret)
+# split data for training, validation and testing
+#60% train, 20% validation, 20% test
+#stock data is a time series, so the split is chronological (oldest to Train, newest to Test).
+#A random split would train on days that come after the days it is tested on.
+n <- nrow(optt_ml)
+n_train <- floor(0.6 * n)
+n_valid <- floor(0.2 * n)
 
-set.seed(10092026)
-n_train <- floor(0.7 * nrow(optt_ml))
 Train <- optt_ml[1:n_train, ]
-Test <- optt_ml[(n_train + 1):nrow(optt_ml), ]
+Valid <- optt_ml[(n_train + 1):(n_train + n_valid), ]
+Test <- optt_ml[(n_train + n_valid + 1):n, ]
+TrainValid <- rbind(Train, Valid)
+
+predictors <- setdiff(names(optt_ml), "next_return")
+x_train <- as.matrix(Train[, predictors])
+x_valid <- as.matrix(Valid[, predictors])
+x_test <- as.matrix(Test[, predictors])
+y_train <- Train$next_return
+y_valid <- Valid$next_return
+y_test <- Test$next_return
+
+#one set of error measures used for every model: RMSE, MAE and directional accuracy,
+#each next to a baseline that always predicts the training average (direction: always the more common of up / not up)
+eval_metrics <- function(actual, pred, train_mean) {
+  tibble(
+    RMSE = sqrt(mean((actual - pred)^2)),
+    baseline_RMSE = sqrt(mean((actual - train_mean)^2)),
+    MAE = mean(abs(actual - pred)),
+    baseline_MAE = mean(abs(actual - train_mean)),
+    #direction = up (return above zero) versus not up (zero or down), for the model and the baseline alike
+    directional_accuracy = mean((pred > 0) == (actual > 0)),
+    baseline_directional = max(mean(actual > 0), mean(actual <= 0))
+  )
+}
 
 summary(Train)
+summary(Valid)
 summary(Test)
+```
+
+The table below reports the dates covered by each part. The three periods differ in volatility, so
+a model's Test error is partly a statement about the period it is tested on.
+
+```{r}
+#| output: true
+
+split_summary <- tibble(
+  set = c("Train", "Valid", "Test"),
+  start = ml_dates[c(1, n_train + 1, n_train + n_valid + 1)],
+  end = ml_dates[c(n_train, n_train + n_valid, n)],
+  days = c(nrow(Train), nrow(Valid), nrow(Test)),
+  mean_return = c(mean(y_train), mean(y_valid), mean(y_test)),
+  sd_return = c(sd(y_train), sd(y_valid), sd(y_test)),
+  max_abs_return = c(max(abs(y_train)), max(abs(y_valid)), max(abs(y_test)))
+)
+
+split_summary |>
+  kable(digits = 2) |>
+  kable_styling(font_size = 10)
+```
+
+Volume has to be on one consistent basis across the whole history for the volume-based variables to mean
+the same thing in every period. The table below shows the median and mean daily Volume and the daily return
+volatility for each calendar year; a sudden change of orders of magnitude in a single year would point to
+a split that has not been adjusted for.
+
+```{r}
+#| output: true
+
+optt_model_tidy |>
+  group_by(Year) |>
+  summarise(median_volume = median(Volume),
+            mean_volume = mean(Volume),
+            return_sd = sd(log(Adjusted / lag(Adjusted)) * 100, na.rm = TRUE),
+            .groups = "drop") |>
+  mutate(Year = as.character(Year)) |>
+  kable(digits = c(0, 0, 0, 2), format.args = list(big.mark = ",")) |>
+  kable_styling(font_size = 9)
 ```
 
 ## Ridge Regression (results don't mean much now, acts as a stabiliser in the weighted model)
 
 ```{r}
-# ridge regression on the same Train/Test split as the other models
-#predicting next_return, the same outcome as the random forest
-
-x_train <- makeX(Train[, setdiff(names(Train), "next_return")], na.impute = TRUE)
-x_test <- makeX(Test[, setdiff(names(Test), "next_return")], na.impute = TRUE)
-y_train <- Train$next_return
-y_test <- Test$next_return
+# ridge regression on the same Train/Valid/Test split as the other models
+#predicting next_return, the same outcome as the random forest and XGBoost
+#glmnet standardises the predictors internally, so no scaling is needed here
 
 ridge <- glmnet(x_train, y_train, alpha = 0)
 
 plot(ridge, xvar = "lambda", label = TRUE)
 
-#Perform 10-fold cross-validation on Train only
-#folds are contiguous blocks of days (not random) since this is a time series
-set.seed(11142026) # For reproducibility
-foldid <- rep(1:10, each = ceiling(nrow(x_train) / 10))[1:nrow(x_train)]
-cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0, foldid = foldid)
-
-# Plot cross-validation results
-plot(cv_ridge)
-
-# Extract the optimal lambda values
-best_lambda <- cv_ridge$lambda.min
+#choose lambda on the Valid set (later days than Train, so no look-ahead)
+valid_pred_ridge <- predict(ridge, newx = x_valid)
+valid_rmse_ridge <- sqrt(colMeans((y_valid - valid_pred_ridge)^2))
+best_lambda <- ridge$lambda[which.min(valid_rmse_ridge)]
 cat("Best Lambda:", best_lambda, "\n")
 
-# Alternatively, you can use lambda.1se for a more regularized, simpler model
-lambda_1se <- cv_ridge$lambda.1se
+#Plot the validation error across lambda
+plot(log(ridge$lambda), valid_rmse_ridge, type = "l",
+     xlab = "log(lambda)", ylab = "Validation RMSE")
+abline(v = log(best_lambda), lty = 2)
 
-# Extract coefficients at the optimal lambda
-final_coefficients <- coef(cv_ridge, s = "lambda.min")
+#refit on Train + Valid at the chosen lambda, then score Test once
+ridge_final <- glmnet(rbind(x_train, x_valid), c(y_train, y_valid), alpha = 0, lambda = best_lambda)
+
+# Extract coefficients at the chosen lambda
+final_coefficients <- coef(ridge_final)
 print(final_coefficients)
 
-# Predict on Train and Test, then compare RMSE
-pred_train <- predict(cv_ridge, s = "lambda.min", newx = x_train)
-pred_test <- predict(cv_ridge, s = "lambda.min", newx = x_test)
-
-rmse_train <- sqrt(mean((y_train - pred_train)^2))
-rmse_test <- sqrt(mean((y_test - pred_test)^2))
-
-#baseline: always predict the training mean
-rmse_baseline <- sqrt(mean((y_test - mean(y_train))^2))
-
-cat("Train RMSE:", rmse_train, "\nTest RMSE:", rmse_test, "\nBaseline RMSE:", rmse_baseline, "\n")
+pred_test_ridge <- as.numeric(predict(ridge_final, newx = x_test))
+ridge_results <- eval_metrics(y_test, pred_test_ridge, mean(c(y_train, y_valid)))
 ```
 
 ## Random Forest
 
 ```{r}
+#random forest: choose mtry and nodesize on the Valid set, refit on Train + Valid, then score Test once
+set.seed(10092026)
+rf_grid <- expand.grid(mtry = c(2, 3, 4, 6, 8), nodesize = c(5, 25, 50))
+rf_grid$valid_rmse <- NA_real_
 
-rf <- randomForest(next_return ~ .,data = Train, ntree = 500, importance = TRUE, proximity = TRUE)
+for (g in seq_len(nrow(rf_grid))) {
+  fit_g <- randomForest(next_return ~ ., data = Train, ntree = 300,
+                        mtry = rf_grid$mtry[g], nodesize = rf_grid$nodesize[g])
+  rf_grid$valid_rmse[g] <- sqrt(mean((Valid$next_return - predict(fit_g, Valid))^2))
+}
+
+best_rf <- rf_grid[which.min(rf_grid$valid_rmse), ]
+print(best_rf)
+
+rf <- randomForest(next_return ~ ., data = TrainValid, ntree = 500, mtry = best_rf$mtry,
+                   nodesize = best_rf$nodesize, importance = TRUE)
 print(rf)
 important <- importance(rf)
 print(important)
 varImpPlot(rf)
-rf_maxnodes <- randomForest(next_return ~ . , data = Train, maxnodes = 10)
-rf_maxnodes
 
-predictions <- predict(rf, Train)
-predictions
+pred_test_rf <- predict(rf, Test)
+rf_results <- eval_metrics(y_test, pred_test_rf, mean(TrainValid$next_return))
 
-library(MASS)
-mds <- cmdscale(1-rf$proximity)
-plot(mds, col=as.numeric(cut(Train$next_return, breaks = 3)), pch=19, main="MDS of Proximity")
-#text(mds, labels = row.names(Train), cex = 0.7)
-
-rf_tune <- randomForest(next_return ~ ., data = Train, ntree=100, mtry = 2)
-print(rf_tune)
-
-best_mtry <- tuneRF(x=Train[, -which(names(Train) == "next_return")], y=Train$next_return, ntreeTry=500)
-print(best_mtry)
-
-rf <- randomForest(next_return ~., data=Train, keep.forest = TRUE)
-
-#can assign weights once I am happy with the model + variables. 
+#can assign weights once I am happy with the model + variables.
 #weights <- assign here
 #weighted_rf <- randomForest(next_return ~., data = Train, weights = weights)
 
@@ -864,38 +1233,73 @@ rf <- randomForest(next_return ~., data=Train, keep.forest = TRUE)
 ```{r}
 #install.packages("xgboost")
 library(xgboost)
-#install.packages("modeldata")
-library(modeldata)
 
-x_train <- as.matrix(Train[, setdiff(names(Train), "next_return")])
-x_test <- as.matrix(Test[, setdiff(names(Test), "next_return")])
-dtrain <- xgb.DMatrix(data = x_train, label = Train$next_return)
-dtest  <- xgb.DMatrix(data = x_test, label = Test$next_return)
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dvalid <- xgb.DMatrix(data = x_valid, label = y_valid)
+dtest  <- xgb.DMatrix(data = x_test, label = y_test)
 
 param <- list(eval_metric = "rmse",
               objective = "reg:squarederror",
               eta = 0.01,
               max_depth = 3,
-              subsample = 0.7, 
+              subsample = 0.7,
               colsample_bytree = 0.7,
               min_child_weight = 10)
-watchlist <- list(train = dtrain, eval = dtest)
 
+#early stopping watches the LAST entry, so it is the Valid set (Test is never used here)
+evals <- list(train = dtrain, valid = dvalid)
+
+set.seed(10092026)
 xgb <- xgb.train(params = param,
                  data = dtrain,
-                 nrounds = 500,
-                 watchlist = watchlist, 
+                 nrounds = 1000,
+                 evals = evals,
                  early_stopping_rounds = 50,
                  print_every_n = 50)
 
-pred_test <- predict(xgb, dtest)
-rmse_test <- sqrt(mean((Test$next_return - pred_test)^2))
-rmse_baseline <- sqrt(mean((Test$next_return - mean(Train$next_return))^2))
+#number of rounds that gave the lowest Valid error
+#the log's column is called valid_rmse or valid-rmse depending on the xgboost version, so find it by prefix
+eval_log <- as.data.frame(xgb$evaluation_log)
+valid_col <- grep("^valid", names(eval_log), value = TRUE)
+best_nrounds <- if (length(valid_col) == 1) which.min(eval_log[[valid_col]]) else integer(0)
 
-cat("Test RMSE:", rmse_test, "\nBaseline RMSE:", rmse_baseline, "\n")
+#fallbacks if this version does not keep the log: the stored best iteration (counted from 0 in the attribute)
+if (length(best_nrounds) != 1) best_nrounds <- as.integer(xgb$best_iteration)
+if (length(best_nrounds) != 1) {
+  best_attr <- xgb.attr(xgb, "best_iteration")
+  if (!is.null(best_attr)) best_nrounds <- as.integer(best_attr) + 1
+}
+stopifnot(length(best_nrounds) == 1, !is.na(best_nrounds)) #stop here, with a clear message, if none of the above worked
+cat("XGBoost rounds used for the final fit:", best_nrounds, "\n")
+
+#refit on Train + Valid with that many rounds, then score Test once
+dtrainvalid <- xgb.DMatrix(data = rbind(x_train, x_valid), label = c(y_train, y_valid))
+set.seed(10092026)
+xgb_final <- xgb.train(params = param, data = dtrainvalid, nrounds = best_nrounds, verbose = 0)
+
+pred_test_xgb <- predict(xgb_final, dtest)
+xgb_results <- eval_metrics(y_test, pred_test_xgb, mean(c(y_train, y_valid)))
 ```
 
+## Model Comparison
 
+All three models are scored on the same Test rows with the same outcome. RMSE and MAE are in percentage
+points of log return (lower is better), and each is shown next to the baseline that always predicts the
+training average. Directional accuracy is the share of days where the model correctly called up (a return above zero)
+versus not up (zero or down), next to the share that always predicting the more common of the two would get.
+
+```{r}
+#| output: true
+
+model_comparison <- bind_rows(Ridge = ridge_results,
+                              `Random Forest` = rf_results,
+                              XGBoost = xgb_results,
+                              .id = "model")
+
+model_comparison |>
+  kable(digits = 3) |>
+  kable_styling(font_size = 9)
+```
 
 ## LightGBM (essentially the inverse of XGBoost - XGBoost is vertical, LightGBM is horizontal)
 ```{}
@@ -916,6 +1320,13 @@ library(tensorflow)
 
 
 
+
+# Appendix: Session Information
+
+```{}
+#| output: true
+sessionInfo()
+```
 
 # References
 
@@ -966,6 +1377,25 @@ Zeileis, A., & Grothendieck, G. (2005). zoo: S3 Infrastructure for Regular and I
 
 Ocean Power Technologies SEC Filings:
 Ocean Power Technologies. (2026). SEC Filings. https://investors.oceanpowertechnologies.com/financial-information/sec-filings
+
+SEC EDGAR Company Filings (all OPTT 10-K filings, CIK 1378140):
+U.S. Securities and Exchange Commission. https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=1378140&type=10-K
+
+SEC XBRL data service (source of the annual figures in alt_data_annual, retrieved 2026-11-25):
+U.S. Securities and Exchange Commission. Revenues: https://data.sec.gov/api/xbrl/companyconcept/CIK0001378140/us-gaap/Revenues.json
+Net income (loss): https://data.sec.gov/api/xbrl/companyconcept/CIK0001378140/us-gaap/NetIncomeLoss.json
+Shares outstanding (10-K cover page): https://data.sec.gov/api/xbrl/companyconcept/CIK0001378140/dei/EntityCommonStockSharesOutstanding.json
+
+Individual 10-K filings consulted:
+OPTT Form 10-K, fiscal year ended April 30, 2011: https://www.sec.gov/Archives/edgar/data/0001378140/000095012311065690/w83499e10vk.htm
+OPTT Form 10-K, fiscal year ended April 30, 2014: https://www.sec.gov/Archives/edgar/data/0001378140/000143774914013630/optt20140715_10k.htm
+OPTT Form 10-K, fiscal year ended April 30, 2015: https://www.sec.gov/Archives/edgar/data/0001378140/000143774915013346/optt20150629_10k.htm
+OPTT Form 10-K, fiscal year ended April 30, 2016: https://www.sec.gov/Archives/edgar/data/0001378140/000143774916035299/optt20160430_10k.htm
+OPTT Form 10-K, fiscal year ended April 30, 2020: https://www.sec.gov/Archives/edgar/data/1378140/000149315220012094/form10-k.htm
+OPTT Form 10-K, fiscal year ended April 30, 2021: https://www.sec.gov/Archives/edgar/data/1378140/000149315221017188/form10-k.htm
+OPTT Form 10-K, fiscal year ended April 30, 2022: https://www.sec.gov/Archives/edgar/data/1378140/000149315222019173/form10-k.htm
+OPTT Form 10-K, fiscal year ended April 30, 2024: https://www.sec.gov/Archives/edgar/data/1378140/000149315224029074/form10-k.htm
+OPTT Form 10-K, fiscal year ended April 30, 2026 (filed 2026-08-19, accession 0001493152-26-039261): https://www.sec.gov/Archives/edgar/data/1378140/000149315226039261/
 
 Ocean Power Technologies Financial History:
 CompaniesMarketCap.com. (2026). Ocean Power Technologies (OPTT) - Revenue, Earnings, Shares Outstanding. https://companiesmarketcap.com/ocean-power-technologies/
